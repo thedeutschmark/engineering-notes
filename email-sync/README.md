@@ -29,7 +29,7 @@ Supabase Edge Function (Deno)
     ├─ Deduplication (5-min window)
     ├─ Deterministic domain matching
     ├─ Deterministic keyword classification
-    ├─ AI fallback (LLM, ~20% of cases)
+    ├─ AI fallback (cost-effective fast model, ~20% of cases)
     ├─ Guardian confidence recalibration
     ├─ Role-title disambiguation
     ├─ Hard guardrails
@@ -186,7 +186,7 @@ The system flags these as conflicts and forces manual review. No auto-applicatio
 
 ~20% of emails can't be classified deterministically. The sender domain doesn't match any job (recruiter used personal email, company uses a third-party hiring platform like Greenhouse), or the email language is ambiguous.
 
-For these cases, the LLM extracts company name, role title, and classification. But raw LLM confidence is unreliable, so a Guardian system recalibrates:
+For these cases, a cost-effective fast model extracts company name, role title, and classification. Not a high-tier model — this is a simpler extraction task and the volume makes cost matter. But raw model confidence is unreliable, so a Guardian system recalibrates:
 
 ```typescript
 // Guardian feature scoring (80% of final confidence)

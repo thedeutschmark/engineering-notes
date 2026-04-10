@@ -73,7 +73,7 @@ Base 70 points, bonuses for having the sections ATS systems look for (summary, e
 
 ## AI rewriting that doesn't lie
 
-The deterministic score tells you where you stand. The AI layer (LLM via Supabase Edge Functions) does the rewriting. This is where most tools go wrong — they let the LLM hallucinate freely. P.A.T.H.O.S. constrains the model hard.
+The deterministic score tells you where you stand. The AI layer (a high-tier model via Supabase Edge Functions) does the rewriting. This is where most tools go wrong — they let the LLM hallucinate freely. P.A.T.H.O.S. constrains the model hard.
 
 ### Truth constraints
 
@@ -151,10 +151,10 @@ The minimum viable bullet needs an action and a result. Situation and task are b
 
 ## Graceful degradation
 
-The AI layer uses an LLM for optimization, but the system is designed to work without it:
+The AI layer uses a high-tier model for optimization, but the system is designed to work without it:
 
 ```
-Tier 1: Full AI        LLM, complete optimization
+Tier 1: Full AI        High-tier model, complete optimization
 Tier 2: Partial AI     Simplified prompt, basic optimization (API timeout/error)
 Tier 3: Local only     Client-side regex + 500-term keyword dictionary (no AI)
 ```
