@@ -29,7 +29,7 @@ Supabase Edge Function (Deno)
     ├─ Deduplication (5-min window)
     ├─ Deterministic domain matching
     ├─ Deterministic keyword classification
-    ├─ AI fallback (Gemini 2.5 Flash, ~20% of cases)
+    ├─ AI fallback (LLM, ~20% of cases)
     ├─ Guardian confidence recalibration
     ├─ Role-title disambiguation
     ├─ Hard guardrails
@@ -186,7 +186,7 @@ The system flags these as conflicts and forces manual review. No auto-applicatio
 
 ~20% of emails can't be classified deterministically. The sender domain doesn't match any job (recruiter used personal email, company uses a third-party hiring platform like Greenhouse), or the email language is ambiguous.
 
-For these cases, Gemini 2.5 Flash extracts company name, role title, and classification. But raw LLM confidence is unreliable, so a Guardian system recalibrates:
+For these cases, the LLM extracts company name, role title, and classification. But raw LLM confidence is unreliable, so a Guardian system recalibrates:
 
 ```typescript
 // Guardian feature scoring (80% of final confidence)
@@ -364,4 +364,4 @@ The hardest edge cases aren't technical — they're linguistic. Recruiters who w
 
 ## Running it
 
-This is part of [P.A.T.H.O.S.](https://yourpathos.app). The Edge Function is at `supabase/functions/ghost-listener/index.ts`. The full system design context is in the [P.A.T.H.O.S. engineering note](https://github.com/thedeutschmark/engineering-notes/tree/main/resume-optimization).
+This is part of [P.A.T.H.O.S.](https://yourpathos.app). The Edge Function is at `supabase/functions/ghost-listener/index.ts`. The full system design context is in the [P.A.T.H.O.S. engineering note](https://github.com/thedeutschmark/engineering-notes/tree/main/how-i-built-pathos).

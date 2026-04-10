@@ -73,7 +73,7 @@ Base 70 points, bonuses for having the sections ATS systems look for (summary, e
 
 ## AI rewriting that doesn't lie
 
-The deterministic score tells you where you stand. The AI layer (Gemini 2.5 Pro via Supabase Edge Functions) does the rewriting. This is where most tools go wrong — they let the LLM hallucinate freely. P.A.T.H.O.S. constrains the model hard.
+The deterministic score tells you where you stand. The AI layer (LLM via Supabase Edge Functions) does the rewriting. This is where most tools go wrong — they let the LLM hallucinate freely. P.A.T.H.O.S. constrains the model hard.
 
 ### Truth constraints
 
@@ -151,10 +151,10 @@ The minimum viable bullet needs an action and a result. Situation and task are b
 
 ## Graceful degradation
 
-The AI layer uses Gemini 2.5 Pro for optimization, but the system is designed to work without it:
+The AI layer uses an LLM for optimization, but the system is designed to work without it:
 
 ```
-Tier 1: Full AI        Gemini Pro, complete optimization
+Tier 1: Full AI        LLM, complete optimization
 Tier 2: Partial AI     Simplified prompt, basic optimization (API timeout/error)
 Tier 3: Local only     Client-side regex + 500-term keyword dictionary (no AI)
 ```
@@ -187,7 +187,7 @@ Confidence tiers: Severe (75+), High (50-74), Moderate (25-49), Low (0-24). All 
 
 ## Ghost Listener: knowing when you've been ghosted
 
-The other ghost problem. You apply, you wait, you hear nothing. Or you get a rejection email three weeks later and miss it in your inbox. The Ghost Listener is an [inbound email sync system](https://github.com/thedeutschmark/engineering-notes/tree/main/inbound-email-sync) that auto-detects application responses and updates your pipeline — deterministic domain matching and keyword classification for 80% of cases, Guardian-calibrated AI fallback for the rest. It has its own write-up because the problem space (webhook auth, multi-provider forwarding detection, confidence-gated auto-application with undo support) was complex enough to deserve one.
+The other ghost problem. You apply, you wait, you hear nothing. Or you get a rejection email three weeks later and miss it in your inbox. The Ghost Listener is an [inbound email sync system](https://github.com/thedeutschmark/engineering-notes/tree/main/email-sync) that auto-detects application responses and updates your pipeline — deterministic domain matching and keyword classification for 80% of cases, Guardian-calibrated AI fallback for the rest. It has its own write-up because the problem space (webhook auth, multi-provider forwarding detection, confidence-gated auto-application with undo support) was complex enough to deserve one.
 
 ### Response latency intelligence
 
