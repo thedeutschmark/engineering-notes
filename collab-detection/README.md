@@ -1,37 +1,38 @@
 # Multi-Signal Collab Detection for Twitch
 
-How I built a confidence-ranked system that detects past collaborations between Twitch streamers using four independent signal sources — and why the "never downgrade" upsert policy makes it work.
+How I built a confidence-ranked system for detecting likely collaborations between Twitch streamers from multiple imperfect signals, and why the persistence rules mattered as much as the detection logic.
 
 ## The problem
 
-I built a [collab planner](https://collab.deutschmark.online) for Twitch streamers. A core feature is collab history — showing who you've collaborated with and when. The obvious approach is to let users manually log every collab. Nobody does this.
+I built a [collab planner](https://collab.deutschmark.online) for Twitch streamers. One of the core features is collab history: who someone has streamed with, and when.
 
-So the system needs to detect collabs automatically from available data. The challenge: there's no single reliable signal. The Twitch API doesn't have a "these two people collaborated" endpoint. You have to triangulate from multiple imperfect sources and decide how much to trust each one.
+The obvious version is manual entry. In practice that does not scale. Streamers rarely log every collab, and many of the most useful signals only appear after the fact in titles, VODs, or event data.
 
-## Signal sources and their failure modes
+There is also no single authoritative source. Twitch does not expose a universal "these two creators collaborated" endpoint, so the system has to infer from several sources with different failure modes.
 
-I ended up with four tiers, ranked by reliability:
+## Signal tiers
 
+I ended up with four sources, ordered by reliability:
+
+```text
+Tier 1: confirmed_event     user-created event with explicit participants
+Tier 2: guest_star          Twitch Guest Star session data
+Tier 3: vod_title_mention   @mentions or title patterns indicating a collab
+Tier 4: stream_overlap      both streamers live at the same time for >= 30 min
 ```
-Tier 1: confirmed_event     User explicitly created an event with participants
-Tier 2: guest_star          Twitch Guest Star API session records
-Tier 3: vod_title_mention   @mentions or "collab" keywords in VOD titles
-Tier 4: stream_overlap      Both streamers live at the same time, ≥30 min
-```
 
-Each has different failure modes:
+Each source tells a different kind of truth:
 
-**Confirmed events** are ground truth but require manual input. Most streamers don't pre-plan — they just raid someone and start streaming together.
+- `confirmed_event` is explicit and user-authored
+- `guest_star` is platform-native but scope-limited
+- `vod_title_mention` is strong when present but inconsistently used
+- `stream_overlap` is broad coverage with the most noise
 
-**Guest Star** is Twitch's native collab feature. The API exists (`/helix/guest_star/session`) but requires `channel:read:guest_star` scope on channels you own or moderate. You can't query other people's guest star history. Not all collabs use Guest Star anyway.
+That matters because the downstream design is not "find one perfect signal." It is "combine imperfect signals, preserve the strongest evidence, and avoid corrupting good data on later runs."
 
-**VOD title mentions** catch collabs that streamers announce in their title ("Playing Lethal Company w/ @Alice"). High signal when present, but many streamers don't update their title, use display names instead of handles, or write titles in other languages.
+## Confidence mapping
 
-**Stream overlap** is the broadest net — if two people were live at the same time for 30+ minutes, maybe they were together. But two streamers can be live simultaneously while playing completely different games in different time zones. This is the noisiest signal.
-
-## The confidence hierarchy
-
-Every detected signal gets a confidence level:
+Each detected signal is assigned a confidence level:
 
 ```typescript
 const CONFIDENCE_RANK: Record<string, number> = {
@@ -41,24 +42,24 @@ const CONFIDENCE_RANK: Record<string, number> = {
 };
 ```
 
-The mapping:
+The mapping is:
 
-```
-Signal                         Condition                    Confidence
-──────────────────────────────────────────────────────────────────────
-confirmed_event                always                       high
-guest_star                     always                       high
-vod_title_mention (@handle)    explicit @mention in title   high
-vod_title_mention (keyword)    name + collab keyword        high
-stream_overlap                 same game_id                 high
-stream_overlap                 different games              medium
+```text
+confirmed_event                -> high
+guest_star                     -> high
+vod_title_mention (@handle)    -> high
+vod_title_mention (keyword)    -> high
+stream_overlap + same game     -> high
+stream_overlap + different game -> medium
 ```
 
-A bare name mention *without* a collab keyword is deliberately **not persisted**. Early versions did this and generated false positives like "practicing w/ no mic" matching a friend named "mic" or "playing with fire" matching a friend named "fire."
+Here, `high` does not mean "ground truth in the abstract." It means "strong enough within this system to win conflict resolution and surface confidently in the UI."
 
-## The never-downgrade rule
+One important exclusion: a bare name mention without a collab keyword is not persisted. That version produced too many false positives early on.
 
-This is the design decision that makes the whole system work. When persisting a signal:
+## The persistence rule that made the system stable
+
+The key design choice was simple: never replace a stronger signal with a weaker one.
 
 ```typescript
 for (const s of signals) {
@@ -75,24 +76,22 @@ for (const s of signals) {
     (CONFIDENCE_RANK[existing.confidence] ?? 0) >
       (CONFIDENCE_RANK[s.confidence] ?? 0)
   ) {
-    continue; // never overwrite higher confidence with lower
+    continue;
   }
 
   await prisma.collabSignal.upsert({ ... });
 }
 ```
 
-Why this matters: detection runs repeatedly — on schedule refresh, stream history fetch, and manual trigger. Without the guard, a re-run could downgrade a user-confirmed collab to a medium-confidence stream overlap. The never-downgrade policy means ground truth is permanent. You can re-run detection as often as you want without corrupting good data.
+Detection runs repeatedly: after stream-history refreshes, schedule syncs, and manual triggers. Without this guard, a later low-signal pass could overwrite a confirmed event with a weaker overlap-based inference. With it, the system becomes monotonic in the useful direction: better evidence can replace weaker evidence, but weaker evidence cannot erode stronger evidence.
 
-The composite unique key `(friendId, partnerLogin, detectedAt)` allows multiple signals from the same partner on different dates while preventing duplicates for the same date.
+That one rule made reprocessing safe.
 
-## Detection pipeline
+## Stage 1: VOD title analysis
 
-### Stage 1: VOD title analysis
+The first stage looks at title text in two passes.
 
-Two parallel passes over a friend's VOD history:
-
-**Pass A — @mention extraction:**
+### Pass A: explicit `@mentions`
 
 ```typescript
 const mentionRegex = /@([a-zA-Z0-9_]{4,25})/g;
@@ -110,16 +109,15 @@ for (const vod of vods) {
         source: "vod_title_mention",
         confidence: "high",
         evidence: vod.title,
-        // ...
       });
     }
   }
 }
 ```
 
-@mentions are high confidence because streamers rarely @-mention someone in their title unless they're actually collaborating.
+This was the cleanest inferred signal in practice. Streamers do not usually `@mention` someone in a title unless that person is relevant to the stream.
 
-**Pass B — keyword + name combo:**
+### Pass B: keyword-gated name matching
 
 ```typescript
 const COLLAB_KEYWORDS = [
@@ -146,18 +144,17 @@ for (const vod of vods) {
         source: "vod_title_mention",
         confidence: "high",
         evidence: vod.title,
-        // ...
       });
     }
   }
 }
 ```
 
-The **keyword gate** is critical. Without it, any title containing a friend's name would register as a collab. With it, you need both a collab-indicating keyword AND the friend's name. Display names have a minimum length check (≥3 chars) to avoid matching common words.
+The keyword gate is what kept this useful. Matching on names alone was too permissive. Requiring both a collab-like phrase and a candidate name pushed the precision high enough to keep.
 
-### Stage 2: Confirmed events
+## Stage 2: confirmed events
 
-Events are user-created and have explicit participant lists:
+User-created events provide explicit participant lists:
 
 ```typescript
 const confirmedCollabs = await prisma.collabHistory.findMany({
@@ -176,20 +173,19 @@ for (const collab of confirmedCollabs) {
       source: "confirmed_event",
       confidence: "high",
       evidence: `Event: ${collab.event.title} on ${collab.event.startTime}`,
-      // ...
     });
   }
 }
 ```
 
-Since these come from user input, they're always high confidence. The never-downgrade rule means once an event is confirmed, no amount of re-running title parsing can change it.
+These are always treated as high confidence. More importantly, once persisted, they remain protected from later lower-confidence passes because of the never-downgrade rule.
 
-### Stage 3: Stream overlap
+## Stage 3: stream overlap
 
-The most algorithmically interesting stage. For each pair of friends with VOD history, check for temporal overlap:
+Stream overlap is the noisiest signal and the broadest net:
 
 ```typescript
-const MIN_OVERLAP_MS = 30 * 60 * 1000; // 30 minutes
+const MIN_OVERLAP_MS = 30 * 60 * 1000;
 
 for (const myVod of myVods) {
   const myStart = myVod.startedAt.getTime();
@@ -203,8 +199,7 @@ for (const myVod of myVods) {
                     Math.max(myStart, theirStart);
 
     if (overlap >= MIN_OVERLAP_MS) {
-      const sameGame = myVod.gameId &&
-                       myVod.gameId === theirVod.gameId;
+      const sameGame = myVod.gameId && myVod.gameId === theirVod.gameId;
 
       signals.push({
         source: "stream_overlap",
@@ -212,20 +207,17 @@ for (const myVod of myVods) {
         evidence: sameGame
           ? `Both streamed ${myVod.gameName} for ${Math.round(overlap / 60000)} min`
           : `Overlapping streams for ${Math.round(overlap / 60000)} min`,
-        // ...
       });
     }
   }
 }
 ```
 
-**Game matching** is the confidence differentiator. Two people streaming the same game at the same time is a much stronger signal than two people streaming different games simultaneously. Same-game overlap gets high confidence; different-game overlap gets medium.
+The 30-minute threshold filters out incidental overlap. Game matching then separates stronger inferences from weaker ones. Two people streaming the same game at the same time is still not proof, but it is materially stronger than two unrelated streams that happened to overlap.
 
-**The 30-minute threshold** filters out brief overlaps. If Alice streams 2-10pm and Bob streams 9:55-11pm, the 5-minute overlap isn't meaningful. 30 minutes is long enough that if they're playing the same game, they're probably playing together.
+## Self-reference filtering
 
-### Self-reference filtering
-
-Every stage filters out self-references to prevent a streamer from being detected as collaborating with themselves:
+Every stage uses the same self-reference check:
 
 ```typescript
 function isSelfReference(
@@ -240,7 +232,7 @@ function isSelfReference(
 }
 ```
 
-This catches the case where a streamer's title says "w/ @themselves" or their VOD title contains their own display name.
+That prevents common nonsense cases like a streamer being detected as collaborating with themselves because their own name appears in the title.
 
 ## Data model
 
@@ -251,9 +243,9 @@ model CollabSignal {
   partnerName  String
   partnerLogin String   @default("")
   detectedAt   DateTime
-  source       String        // "confirmed_event" | "guest_star" | "vod_title_mention" | "stream_overlap"
-  evidence     String        // human-readable proof
-  confidence   String        // "high" | "medium" | "weak"
+  source       String
+  evidence     String
+  confidence   String
   fetchedAt    DateTime @default(now())
   friend       Friend   @relation(fields: [friendId], references: [id], onDelete: Cascade)
 
@@ -261,56 +253,55 @@ model CollabSignal {
 }
 ```
 
-The composite unique key `[friendId, partnerLogin, detectedAt]` is the backbone of the upsert logic. It says: for a given friend-partner pair on a given date, there's exactly one signal. If we detect the same collab from multiple sources (title mention AND stream overlap), the higher-confidence one wins.
+The composite unique key is what makes the upsert semantics clean: one friend-partner-date record, many possible ways to discover it, strongest evidence wins.
 
-## Execution triggers
+## Execution model
 
-Detection doesn't run on a timer. It piggybacks on data fetches:
+Detection is triggered by data activity rather than a separate background scheduler:
 
+```text
+stream history refresh -> fetchAndStoreStreamHistory() -> detectCollabSignals()
+schedule sync          -> refreshSchedules()           -> detectCollabSignals()
+manual trigger         -> POST /api/friends/[id]/collabs
+bulk sync              -> Promise.allSettled(...)
 ```
-Stream history refresh → fetchAndStoreStreamHistory() → detectCollabSignals()
-Schedule sync          → refreshSchedules()           → detectCollabSignals()
-Manual trigger         → POST /api/friends/[id]/collabs
-Bulk sync              → Promise.allSettled(friends.map(detectCollabSignals))
-```
 
-`Promise.allSettled` is important for the bulk path — one friend's Twitch API error shouldn't block detection for the other 30.
+`Promise.allSettled` matters on the bulk path. One friend's API failure should not block the rest of the batch.
 
-## Twitch API constraints that shaped the design
+## Twitch constraints that shaped the system
 
-1. **No public VOD access for arbitrary users.** You can only fetch VODs for users whose IDs you know. The system requires friends to be registered first.
+Several API limits pushed the design in this direction:
 
-2. **Game data is unreliable.** Helix often returns `null` for `game_id` on archived streams. The system falls back to Twitch's undocumented GQL endpoint to pull chapter markers from VODs.
+1. VOD history is only useful once a user is known to the system.
+2. Game metadata is inconsistent enough that archived-stream enrichment sometimes needs a fallback path.
+3. Guest Star data is scope-locked; you cannot use it as a universal public signal.
+4. Historical windows are finite, so very old collabs may only reappear if they recur or were explicitly confirmed.
 
-3. **Guest Star is scope-locked.** `channel:read:guest_star` only works on channels you own or moderate. You can't query whether your friend had guest stars on their channel. This limits Guest Star detection to the authenticated user's own channel.
+Those constraints are why the system leans so heavily on repeatable inference plus durable persistence rules.
 
-4. **50-VOD window.** Helix returns up to 100 videos per request. The system caps at 50 most recent to keep detection fast. Collabs older than ~50 streams back won't be rediscovered unless they recur.
+## What worked and what did not
 
-## Results and tradeoffs
+What held up well:
 
-**What works well:**
-- @mentions are nearly perfect — streamers who use them in titles get accurate, high-confidence collab history with zero manual input.
-- The keyword gate eliminated false positives from name-only title matching.
-- Never-downgrade means users can trust that manually confirmed collabs won't get clobbered.
-- Running detection on every data fetch means the system is always up to date without a separate cron job.
+- Explicit `@mentions` were the highest-precision inferred signal
+- The keyword gate prevented most name-only false positives
+- Never-downgrade kept reruns safe
+- Piggybacking on existing fetch paths kept the data fresh without adding scheduler complexity
 
-**Known limitations:**
-- English-only keyword list. Non-English streamers' collab announcements are missed.
-- Stream overlap without game matching produces medium-confidence noise. Two streamers in different time zones who happen to stream simultaneously get flagged.
-- Guest Star integration is stubbed but not wired. Requires adding an OAuth scope and handling broadcaster-level tokens.
-- The system can't detect collabs that weren't recorded as VODs (stream not archived, VOD deleted).
+What is still imperfect:
 
-**What I'd do differently:**
-- Add a feedback loop: let users dismiss false positives, which would train a per-user keyword blocklist.
-- Weight overlap confidence by recency — two people who overlapped 3 times this month are more likely collaborating than two people who overlapped once 6 months ago.
-- Consider fuzzy name matching (Levenshtein distance) for display names, with a higher confidence threshold to compensate for the fuzziness.
+- The keyword list is English-only
+- Overlap-based inference still produces some medium-confidence noise
+- Guest Star support is structurally limited by OAuth scope
+- Deleted or unarchived streams are invisible to this approach
 
-## The philosophy
+## What I would add next
 
-The system is designed around a pragmatic insight: **it's better to surface a collab with medium confidence than to miss it entirely.** Users can always confirm or dismiss. The never-downgrade rule means the system gets more accurate over time as users interact with it, never less.
-
-The four-tier hierarchy isn't about finding one perfect signal — it's about layering imperfect signals so that in aggregate, the system catches most real collabs while keeping false positives manageable.
+- User feedback loops for false positives and dismissals
+- Recency weighting for repeated overlaps
+- Better display-name matching with careful thresholds
+- Language-specific keyword packs instead of one English-centric list
 
 ## Running it
 
-This is part of [Twitch Friends Organizer](https://collab.deutschmark.online). The detection engine is at `lib/twitch/detectCollabs.ts`. The API endpoint at `POST /api/friends/[id]/collabs` triggers detection and returns the full signal list.
+This is part of [Twitch Friends Organizer](https://collab.deutschmark.online). The detection engine lives in `lib/twitch/detectCollabs.ts`, and `POST /api/friends/[id]/collabs` triggers a full run and returns the detected signal set.
