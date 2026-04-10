@@ -187,41 +187,15 @@ Confidence tiers: Severe (75+), High (50-74), Moderate (25-49), Low (0-24). All 
 
 ## Ghost Listener: knowing when you've been ghosted
 
-The other ghost problem. You apply, you wait, you hear nothing. Or you get a rejection email three weeks later and miss it in your inbox. The Ghost Listener is an inbound email sync system that auto-detects application responses and updates your pipeline.
-
-### How it works
-
-Users get a forwarding alias: `track_{hash}@sync.yourpathos.app`. Set up email forwarding, and every recruiter response gets processed automatically.
-
-**Step 1: Authentication.** Resend webhook with Svix HMAC-SHA256 signature verification. 5-minute timestamp tolerance for replay protection.
-
-**Step 2: Deterministic domain matching.** Extract the sender's domain, normalize it (strip TLD variants, remove Inc/LLC/Corp), and match against the user's job pipeline. `recruiting@amazon.co.uk` → `amazon` → matches the Amazon SDE role you applied to. Zero AI cost for 80%+ of cases.
-
-**Step 3: Keyword classification.** 49 rejection patterns ("unfortunately," "not moving forward," "another candidate"), 16 interview patterns ("schedule interview," "phone screen," "Calendly"), 10 offer patterns. Deterministic regex, no LLM.
-
-**Step 4: AI fallback.** Only fires when domain matching fails or classification is ambiguous. Uses Gemini 2.5 Flash (not Pro — this is a simpler task). The model extracts company name and role title, then a Guardian confidence system recalibrates:
-
-```
-Final confidence = (0.80 × Guardian score) + (0.20 × raw LLM confidence)
-
-Guardian features:
-  lexical_match      Standard recruiting boilerplate detected
-  semantic_match     Clear intent (rejection/interview/offer)
-  structure_match    Professional email layout
-  logic_consistency  No conflicting signals
-```
-
-Auto-apply threshold: 0.95 confidence + no guardrail violations. Below that, it's staged for user review. Hard guardrails block dangerous transitions — a rejection signal can't downgrade an offer-stage job, conflicting signals (rejection + interview in the same email) force manual review.
-
-**Privacy:** Raw email bodies are never persisted. Only extracted evidence fields (sender, subject, classification, confidence) hit the database.
+The other ghost problem. You apply, you wait, you hear nothing. Or you get a rejection email three weeks later and miss it in your inbox. The Ghost Listener is an [inbound email sync system](https://github.com/thedeutschmark/engineering-notes/tree/main/inbound-email-sync) that auto-detects application responses and updates your pipeline — deterministic domain matching and keyword classification for 80% of cases, Guardian-calibrated AI fallback for the rest. It has its own write-up because the problem space (webhook auth, multi-provider forwarding detection, confidence-gated auto-application with undo support) was complex enough to deserve one.
 
 ### Response latency intelligence
 
-The system recovers original email timestamps from forwarded message headers and calculates response latency from application date. This feeds back into company intelligence:
+The Ghost Listener recovers original email timestamps from forwarded message headers (Gmail, Outlook, iCloud each format these differently) and calculates response latency from application date:
 
-- Ultra-fast rejection (<1 hour): probably automated
-- Same-day rejection: ATS filter, not a human
-- 2-3 week response: normal cycle
+- Ultra-fast rejection (<1 hour): probably automated ATS filter
+- Same-day rejection: likely automated batch processing
+- 2-3 week response: normal hiring cycle
 - 6+ weeks silence: likely ghosted
 
 This data aggregates across users (anonymized) into company intel cards — ghost rates, average response times, interview conversion rates. You can see that Company X ghosts 73% of applicants before you waste time applying.
