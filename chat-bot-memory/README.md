@@ -114,6 +114,37 @@ The important part is what does **not** happen: neither raw buffer is written to
 
 I also added a stream-start reset action that clears both volatile buffers before a new broadcast begins. That way session boundaries stay clean even if Streamer.bot stays open between streams.
 
+## Streamer speech as a second input source
+
+Chat is only half the conversation. The streamer is talking on mic the entire time, and that context matters — if you said "we'll do a viewer game night next week," the bot should know that.
+
+A separate transcript listener hooks into Streamer.bot's Speech-to-Text action and feeds transcribed speech into the same two buffers with a `[STREAMER]:` prefix. The Brain and Compress scripts don't need any changes — they already read the buffers. They just see richer context now.
+
+The problem is that STT fires constantly and most of it is noise. "Uh." "Yeah." "Ok." "Hmm." Dumping all of that into the buffer wastes space that could hold actual content.
+
+I used a three-layer filter instead of a simple character-length cutoff:
+
+```csharp
+// 1. Floor — catch empty/garbage STT results
+if (cleaned.Length < 3) return true;
+
+// 2. Filler blocklist — O(1) HashSet lookup
+string normalized = cleaned.TrimEnd('.', ',', '!', '?').ToLowerInvariant();
+if (IsFillerOnly(normalized)) return true;
+
+// 3. Word count gate — single words rarely carry memory value
+int wordCount = normalized.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).Length;
+if (wordCount < 2) return true;
+```
+
+The blocklist covers ~40 terms across four categories: hesitation markers (`uh`, `um`, `hmm`, `er`), backchannels (`yeah`, `ok`, `right`, `sure`), single-word reactions (`wow`, `nice`, `cool`), and trailing fillers (`so`, `well`, `like`, `basically`).
+
+"Let's go" passes — two words, not filler. "Nice play" passes. "Uh" doesn't. "Nice" alone doesn't (single word gate). "Basically we need to fix the overlay" passes — it starts with a filler word but the full phrase isn't filler-only.
+
+A naive character-length filter (the first version used 8 chars) either cuts real short phrases or lets through single filler words that happen to be long enough. The hybrid approach keeps meaningful speech and drops noise regardless of string length.
+
+This means the end-of-stream summary captures both sides of the conversation. The bot remembers not just what chat said, but what the streamer said to chat — promises, reactions, topic changes, callouts. That's what makes the memory feel complete instead of one-sided.
+
 ## Layer 2: end-of-stream compression
 
 At stream end, a separate script takes `session_buffer_full` and compresses it into one factual summary.
@@ -368,4 +399,4 @@ That is the whole point of the system. It makes the bot feel like it remembers p
 
 ## Running it
 
-This is part of [persistence_bot](https://github.com/thedeutschmark/persistence_bot). The rolling listener lives in `Listener_ChatLogger.cs`, reply generation in `Brain_PerpetualResponse.cs`, end-of-stream compression in `EndOfStream_Compress.cs`, stream-start reset in `StartOfStream_Reset.cs`, and provider/config setup in `Setup_PerpetualOptions.cs`.
+This is part of [persistence_bot](https://github.com/thedeutschmark/persistence_bot). The chat listener lives in `Listener_ChatLogger.cs`, transcript listener in `Listener_TranscriptLogger.cs`, reply generation in `Brain_PerpetualResponse.cs`, end-of-stream compression in `EndOfStream_Compress.cs`, stream-start reset in `StartOfStream_Reset.cs`, and provider/config setup in `Setup_PerpetualOptions.cs`.
