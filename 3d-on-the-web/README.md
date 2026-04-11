@@ -1,300 +1,147 @@
 # Building 3D Objects for the Web with Three.js
 
-What I learned building eight procedural models for my homepage: how I structured the builders, where the PS1-inspired look helped, where it hurt, and which performance decisions actually mattered.
+*Procedural modeling, PS1-era shading, and canvas-based textures for a homepage carousel.*
+
+I built a homepage where each project card carries its own small rotating 3D object. None of them are imported assets. They are all built directly in code with Three.js primitives, lightweight materials, and procedural textures.
+
+That was not supposed to become a system. It started as one object, then turned into a pattern.
+
+---
 
 ## Why I went procedural
 
-My homepage has eight project cards, each with its own rotating 3D object: a manila folder, VCR, traffic cone, camera, microphone, PDA, desk calendar, and a jury-rigged streaming toolkit hub. None of them are imported `.glb` or `.gltf` assets. Every model is built from Three.js primitives in code.
+The original reason was simple: I wanted a specific look and could not find assets that matched it.
 
-That was not the original plan. I started with one folder model because I wanted a very specific worn, hand-built look and could not find an asset that matched it. After a few more models, the approach became a system.
+Once I had a few models working, the upside of doing it procedurally became clearer:
 
-The upsides were real:
+- no external asset pipeline
+- direct control over silhouette and materials
+- easy color variation per card
+- a consistent visual language across unrelated objects
 
-- No asset loading or asset pipeline
-- Full control over materials and silhouette
-- Procedural textures that can inherit an accent color from the card they sit on
+The downside is obvious too. This is slower to author than dropping in ready-made assets, and every object becomes part of the codebase instead of part of an asset folder.
 
-The tradeoff is authoring cost. A simple model is still a few hundred lines of geometry and texture code. The hub model ended up much larger than that.
+That tradeoff was worth it for this project because the models are small, stylized, and tightly coupled to the site identity.
 
-## The model pattern
+## The modeling pattern that held up
 
-After the first few models I settled on a consistent builder shape: base form first, then subcomponents, then surface detail.
+The useful pattern was not sophisticated. I stopped thinking in terms of "modeling" and started thinking in terms of **assembly**.
 
-```typescript
-export function buildVCRPlayer(accent: THREE.Color): THREE.Object3D {
-  const g = new THREE.Group();
+Each object is built in layers:
 
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(1.1, 0.18, 0.65),
-    psTex(makeBodyTexture(), { roughness: 0.92 }),
-  );
-  g.add(body);
+- a **base form** that establishes the silhouette
+- **secondary shapes** that make the object recognizable
+- **surface treatment** that gives it age, texture, and personality
 
-  // display, tape slot, buttons, labels, screws
+That kept the builders readable and made it easier to share conventions across the whole set without turning the code into one giant generic model factory.
 
-  return g;
-}
-```
+---
 
-That structure kept the models readable. It also made it easy to share conventions across all eight builders, especially around accent handling and material tiers.
+## How a model is actually built
 
-## Material system
+Here is the VCR, which is representative of the pattern.
 
-Most of the rendering look came from two material factories:
+**Base form.** A BoxGeometry at the right proportions. Before it becomes a mesh, the geometry goes through a vertex perturbation pass that adds subtle random displacement to every vertex. That is what makes the object feel hand-built instead of CAD-clean. The amount is small enough to preserve the silhouette but large enough to break the machine-perfect edges.
 
-```typescript
-function psCol(color: number, opts = {}): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({
-    color,
-    roughness: 1,
-    metalness: 0,
-    flatShading: true,
-    side: THREE.DoubleSide,
-    ...opts,
-  });
-  applyPS1Jitter(m);
-  return m;
-}
+**Material.** Every material in the system uses the same factory: flat-shaded, fully matte, double-sided. The factory also injects a **vertex shader modification** that snaps screen-space positions to a coarse grid, creating the polygonal shimmer that defined PS1-era rendering. The grid precision is tuned to be gentle enough to read clearly but coarse enough to feel analog. It also gets coarser with distance from the camera, which keeps close-up objects legible while distant ones shimmer more.
 
-function psTex(texture: THREE.Texture, opts = {}): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({
-    map: texture,
-    roughness: 1,
-    metalness: 0,
-    flatShading: true,
-    side: THREE.DoubleSide,
-    ...opts,
-  });
-  applyPS1Jitter(m);
-  return m;
-}
-```
+**Procedural texture.** This is where most of the character lives. The VCR body texture is a canvas element drawn entirely in code:
 
-`flatShading: true` does most of the aesthetic work. It keeps surfaces faceted and readable without needing dense geometry. From there I mainly varied `roughness`, `metalness`, and occasional `emissive` use:
+- base fill in deep charcoal
+- thousands of tiny random rectangles in faint white to simulate **brushed plastic grain**
+- a thin stroke inset for the shell seam
+- a green monospace clock display
+- button regions with slight color variation
 
-| Roughness | Metalness | Typical use |
-|---|---|---|
-| `0.85-1.0` | `0.0` | cardboard, plastic, matte paint |
-| `0.7-0.9` | `0.05-0.2` | weathered metal, older hardware |
-| `0.3-0.6` | `0.4-0.6` | trim, brushed metal, cleaner accents |
-| `0.0-0.2` | `0.7-0.9` | polished surfaces and highlights |
+The VHS tapes each get their own label texture with different colors, brand text, and simulated wear marks. **Per-face material assignment** maps the label to the top face of the tape geometry and dark plastic to every other face.
 
-The microphone used the widest range. The grille needed to read as metallic, while the sign and indicator lights relied on `emissive` rather than real lights.
+**Assembly.** The tapes are grouped with idle positions (scattered casually) and open positions (fanned out in a row). The builder stores both position sets and a tick function in the group's userData. The carousel animation system calls the tick function each frame, and the tape positions interpolate between idle and open states with staggered easing.
 
-## Procedural textures with canvas
+The other objects follow the same pattern with different specifics. The microphone uses tapered cylinder sections for the body, a sphere for the head cap, a canvas texture for the grill mesh pattern, and a TubeGeometry on a CatmullRom curve for the coiled XLR cable. The PDA has a swappable screen texture so it can show different content depending on card state. The folder has a cover that pivots on a hinge with document pages that fan out on open.
 
-Every label, screen, sticker, stain, and panel treatment comes from a `<canvas>` that gets turned into a Three.js texture. No image assets.
+---
 
-The base pattern is simple noise plus a cheap edge-darkening pass:
+## The look
 
-```typescript
-function makeNoisyTexture(w, h, baseR, baseG, baseB, opts) {
-  const ctx = canvas.getContext("2d");
-  const img = ctx.createImageData(w, h);
+The visual direction started with a stronger PS1 influence than the final site ended up keeping.
 
-  for (let i = 0; i < img.data.length; i += 4) {
-    const px = (i / 4) % w;
-    const py = Math.floor(i / 4 / w);
-    const n = (Math.random() - 0.5) * opts.noise;
+At first I pushed hard on:
 
-    const ex = Math.min(px, w - px) / (w * 0.15);
-    const ey = Math.min(py, h - py) / (h * 0.15);
-    const ao = 0.55 + 0.45 * Math.min(1, Math.min(ex, ey));
+- vertex instability
+- coarse filtering
+- more aggressive geometric distortion
 
-    img.data[i] = (baseR + n) * ao;
-    img.data[i + 1] = (baseG + n) * ao;
-    img.data[i + 2] = (baseB + n) * ao;
-    img.data[i + 3] = 255;
-  }
+It was visually interesting, but it crossed the line from "stylized" into "noisy." On mobile especially, the effect started fighting the content instead of supporting it.
 
-  ctx.putImageData(img, 0, 0);
-}
-```
+The version that survived was the quieter one:
 
-It is not physically accurate ambient occlusion, but it is cheap and it works well for flat panels. On top of that base I layered text, scratches, stains, gradients, doodles, and labels with plain Canvas 2D operations.
+- low-poly forms
+- flat-shaded surfaces
+- restrained imperfections
+- textures that feel worn or handmade rather than clean and synthetic
 
-That let each model carry its own personality. The folder interior has notebook-style sketches. The VCR body has worn labels and panel marks. The hub front panel has stenciled text, rust, scuffs, and sticker damage built up in layers.
+> The models needed personality, not spectacle.
 
-One practical detail: I disabled mipmap generation on these canvas textures. In this scene they are usually rendered near authored size, so skipping mipmaps saved memory and upload work without hurting the look. It does not halve memory usage, but it does avoid the extra mip chain overhead.
+## Procedural textures mattered more than geometry
 
-## Dialing the PS1 look back
+The real identity of the objects came less from the meshes and more from the surfaces.
 
-The original look pushed much harder into PS1-style instability: screen-space vertex snapping, nearest-neighbor filtering, and a geometry distortion pass I called `jankify`.
+Most of the character lives in **canvas-based texture work**:
 
-The vertex shader snapped projected positions to a coarse grid:
+- panel labels drawn with `fillText`
+- brushed plastic grain from thousands of tiny random rectangles
+- edge darkening via procedural ambient occlusion (distance from UV border)
+- radial gradients for depth shadows under raised elements
+- stickers and doodle marks on the folder interior
 
-```glsl
-vec4 mvPosition = modelViewMatrix * vec4(transformed, 1.0);
-gl_Position = projectionMatrix * mvPosition;
+That was the difference between "a box that roughly looks like a VCR" and "an object that feels like it has been around."
 
-float prec = basePrecision * (1.0 + dist * 0.12);
-gl_Position.xy /= gl_Position.w;
-gl_Position.xy = floor(gl_Position.xy * prec) / prec;
-gl_Position.xy *= gl_Position.w;
-```
+I liked this approach because it kept the whole aesthetic inside one system. No image assets, no texture atlas, no separate authoring tool. The downside is that canvas drawing code is verbose and hard to preview without running it. But for a set of eight objects, that cost was manageable.
 
-And `jankify` added random displacement directly to geometry:
-
-```typescript
-function jankify(geo: THREE.BufferGeometry, amount: number) {
-  const pos = geo.attributes.position;
-  const effective = amount * JANKIFY_SCALE;
-  for (let i = 0; i < pos.count; i++) {
-    pos.setX(i, pos.getX(i) + (Math.random() - 0.5) * effective);
-    pos.setY(i, pos.getY(i) + (Math.random() - 0.5) * effective);
-    pos.setZ(i, pos.getZ(i) + (Math.random() - 0.5) * effective);
-  }
-  geo.computeVertexNormals();
-}
-```
-
-On desktop that looked distinctive. On mobile it made text unreadable and motion noisier than I wanted. The full effect was technically interesting but wrong for the product.
-
-The final version kept the influence and dropped the excess:
-
-```text
-Mar 19  heavy jitter + NearestFilter              -> too aggressive
-Mar 29  distance attenuation added                -> better, still brittle
-Apr 9   jitter removed, LinearFilter, AA enabled  -> clean but bland
-Apr 10  subtle jitter restored, gentler geometry  -> final direction
-```
-
-What survived was the part users could feel without having to notice: low polygon counts, flat shading, slightly imperfect geometry, and restrained shimmer. That ended up reading more like "retro-inspired" than "hardware artifact simulator," which was the better fit.
+---
 
 ## Orientation was harder than modeling
 
-The most annoying bug was not shading or textures. It was forward direction.
+The most annoying problem was not shading or performance. It was **orientation**.
 
-Models that looked correct in the carousel would face the wrong way in the bento grid because the two contexts implied different camera relationships. The carousel wrapper rotates each item to face outward:
+As soon as the same objects had to live in multiple presentation contexts, all the hidden inconsistency around what counted as "front" became visible. A model that looked correct in one layout would feel wrong in another because the surrounding scene assumed a different forward axis.
 
-```typescript
-const angle = i * ANGLE_STEP;
-wrapper.position.set(
-  Math.sin(angle) * RING_RADIUS,
-  0,
-  Math.cos(angle) * RING_RADIUS,
-);
-wrapper.rotation.y = -angle;
-```
+That is the kind of problem that does not look glamorous in a postmortem, but it matters. A lot of graphics work is really convention management.
 
-That works cleanly only if every model shares the same definition of "front." Mine did not. Some were built with front on `+Z`, some on `-Z`, and once the same model had to live in both a ring and a head-on grid, those inconsistencies surfaced immediately.
+If I were starting over, I would lock a stricter orientation convention early and make every presentation context respect it instead of patching per-object offsets later.
 
-The short-term fix was per-model overrides:
+## Lighting and performance
 
-```typescript
-const MODEL_SPECS = {
-  0: { initialRotY: 0.2 },
-  3: { initialRotY: Math.PI + 0.25 },
-  6: { initialRotY: Math.PI + 0.1 },
-};
-```
+The lighting stayed intentionally simple. A warm key, a cool fill, and ambient. No shadows, no environment maps. These objects did not need a complicated rig. They needed enough directionality to read clearly and enough restraint that the materials kept the scene coherent.
 
-The real fix would have been a stricter convention from the start: every builder exports a model whose front is `+Z`, and each presentation context owns rotation independently.
+The render path uses an offscreen render target that blits to the canvas through a fullscreen quad. That isolates the 3D pass and keeps the upscale filter consistent. Frame delta is capped so animation interpolation does not explode on tab-switch.
 
-## Lighting
+Performance ended up depending less on polygon count (these are tiny models) and more on broader scene decisions:
 
-The lighting setup stayed simple:
+- how many render paths existed
+- pixel ratio capped below full retina to avoid overdraw
+- canvas textures generated once on init, not per frame
+- no mipmaps (unnecessary at this scale, saves memory)
 
-```typescript
-scene.add(new THREE.AmbientLight(0x2a2f38, 0.5));
+> Renderer architecture matters more than micro-optimizing tiny objects.
 
-const keyLight = new THREE.DirectionalLight(0xffeedd, 1.6);
-keyLight.position.set(5, 3, 5);
-scene.add(keyLight);
+---
 
-const fillLight = new THREE.DirectionalLight(0x6a7a9a, 0.45);
-fillLight.position.set(-3, 2, -2);
-scene.add(fillLight);
-```
+## What worked
 
-Ambient plus key plus fill was enough. Flat-shaded low-poly models benefit more from readable directionality than from a complex light rig. For "live" elements such as LEDs and signs, `emissive` produced a better result than adding extra point lights.
-
-I also used light fog:
-
-```typescript
-scene.fog = new THREE.FogExp2(0x060608, 0.055);
-```
-
-Not enough to obscure anything, just enough to separate front and back of the carousel ring.
-
-## Performance: what actually helped
-
-I spent time optimizing the wrong things early. The wins that mattered were simpler.
-
-### Cap device pixel ratio
-
-```typescript
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
-```
-
-This was the clearest performance improvement. Very high-DPI screens can burn a lot of fill rate for marginal visual gain. Capping the pixel ratio preserved sharpness while cutting unnecessary work.
-
-### Use one renderer and one RAF loop
-
-The site went through three rendering setups:
-
-```text
-Phase 1: one carousel renderer
-Phase 2: carousel renderer + grid renderer
-Phase 3: one unified scene for both layouts
-```
-
-Phase 2 was the worst. Multiple render passes, multiple viewports, and two animation loops added complexity and frame cost at the same time. The unified scene replaced that with one canvas, one scene, and one render call, with models interpolating between carousel and grid positions.
-
-### Skip unnecessary mipmaps
-
-For this specific texture set, disabling mipmap generation reduced texture overhead and simplified uploads. It was worthwhile, just not as dramatic as I first thought.
-
-### What did not matter much
-
-- Polygon count at this scale
-- Small differences in material count
-- `powerPreference` tuning, at least on the devices I tested
-
-The scene was not geometry-bound. It was much more sensitive to pixel cost and renderer architecture.
-
-## Z-fighting and polygon offset
-
-Any flat decal sitting exactly on a flat panel will eventually flicker. The reliable fix was `polygonOffset`:
-
-```typescript
-new THREE.MeshStandardMaterial({
-  map: labelTexture,
-  polygonOffset: true,
-  polygonOffsetFactor: -1,
-  polygonOffsetUnits: -1,
-});
-```
-
-I used more aggressive values for labels layered on top of other overlays. That solved the problem without physically moving geometry around.
-
-## The hub model
-
-The streaming toolkit hub was the most useful model to build because it forced several techniques to work together:
-
-- Layered canvas painting for the front panel
-- Overscaled subcomponents so the silhouette still reads when the model is small
-- Cables built from `CatmullRomCurve3` and `TubeGeometry`
-
-```typescript
-const cablePath = new THREE.CatmullRomCurve3([
-  new THREE.Vector3(-0.15, -0.08, 0.22),
-  new THREE.Vector3(-0.28, -0.18, 0.28),
-  new THREE.Vector3(-0.22, -0.30, 0.14),
-  new THREE.Vector3(0.08, -0.28, 0.24),
-]);
-const cableGeo = new THREE.TubeGeometry(cablePath, 24, 0.013, 6, false);
-```
-
-The scale choices on that model were deliberately not realistic. The mic, lens, and tape deck are oversized because this object had to read immediately at card scale. Realistic proportion mattered less than visual recognition.
+- procedural modeling was the right choice for this scale and style
+- flat shading carried more of the visual language than any fancy shader work
+- canvas textures gave the objects personality without needing an asset library
+- the PS1 vertex snapper at restrained intensity added character without noise
+- simplifying the aesthetic improved the site more than pushing the retro effect harder
 
 ## What I would change next
 
-- Standardize model orientation around a single forward axis
-- Normalize texture sizes to a smaller set of predictable resolutions
-- Separate material styling, geometric distortion, and shader effects into composable layers instead of mixing them together
-- Abstract the repeated canvas-painting patterns into a shared layer system
+- standardize orientation rules much earlier
+- reduce repeated texture-building patterns into a smaller shared system
+- keep the stylization modular so surface treatment and motion treatment can evolve separately
+- keep choosing readability over effect-heavy rendering when the two conflict
 
 ## Running it
 
-This work is part of [deutschmark.online](https://deutschmark.online). The model builders live in `components/carousel/`, the material helpers in `components/carousel/utils.ts`, and the unified renderer in `components/UnifiedScene.tsx`.
+This work is part of [deutschmark.online](https://deutschmark.online).

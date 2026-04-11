@@ -1,348 +1,160 @@
 # Inbound Email Sync for Job Search Pipelines
 
-How I built a system that reads forwarded recruiter emails, classifies what they mean, matches them to the right job, and updates the pipeline with confidence gates and undo support. Most of the work is deterministic. The model is the fallback, not the default.
+*Auto-detecting recruiter responses from forwarded emails with confidence-gated automation and one-click undo.*
+
+I wanted job tracking to stop breaking at the inbox.
+
+That sounds small, but it is one of the biggest failure points in job-search products. Applications scatter across weeks, companies reply from inconsistent addresses, subject lines drift, and users eventually stop maintaining their pipeline by hand because the administrative cost becomes annoying enough to ignore.
+
+So I built a system where the user forwards recruiter mail to a private address and the product decides whether that message should **update state**, **stage a review**, or **do nothing**.
+
+---
 
 ## The problem
 
-Job-search tracking breaks down at the inbox layer. Responses arrive over weeks, often from different senders, with inconsistent subject lines and wildly different phrasing. Some are obvious rejections. Some are interview requests. Some are boilerplate acknowledgments that only become useful later.
-
-I wanted the workflow to be simple: forward the email to a private alias and let the system decide whether it should update the pipeline, stage a review, or do nothing.
-
-The challenge is not parsing email bodies. It is being accurate enough that a user is comfortable letting the system touch state on their behalf.
-
-## Architecture
-
-```text
-Gmail / Outlook / iCloud
-    |
-    | forwarding rule
-    v
-track_{hash}@sync.yourpathos.app
-    |
-    | Resend webhook
-    v
-Supabase Edge Function
-    |
-    |- Svix signature verification
-    |- user lookup by alias
-    |- rate limiting
-    |- deduplication
-    |- deterministic domain matching
-    |- deterministic keyword classification
-    |- model fallback for ambiguous cases
-    |- Guardian confidence recalibration
-    |- role disambiguation
-    |- guardrails
-    '- status update + undo window
-```
-
-The first version lived in a single large Edge Function. That kept shipping simple, but if I were splitting it today I would break out the classifier, guardrails, and provider-specific parsing paths into separate modules.
-
-## Webhook authentication
-
-Inbound mail arrives through Resend, signed with Svix HMAC-SHA256:
-
-```typescript
-async function verifySvixSignature(rawBody: string, headers): Promise<boolean> {
-  const svixId = headers.get("svix-id");
-  const svixTimestamp = headers.get("svix-timestamp");
-  const svixSignature = headers.get("svix-signature");
-
-  if (Math.abs(Date.now() / 1000 - parseInt(svixTimestamp)) > 300) return false;
-
-  const signedContent = `${svixId}.${svixTimestamp}.${rawBody}`;
-  const keyBytes = base64Decode(secret.replace("whsec_", ""));
-  const key = await crypto.subtle.importKey(
-    "raw",
-    keyBytes,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const expected = base64Encode(
-    await crypto.subtle.sign("HMAC", key, encode(signedContent))
-  );
-
-  return svixSignature
-    .split(" ")
-    .some(sig => sig.split(",")[1] === expected);
-}
-```
-
-Two details mattered here:
-
-- Timestamp validation blocks replay attempts.
-- Svix can send multiple signatures during key rotation, so verification has to accept any valid signature in the header rather than assuming a single current key path.
+Parsing email is not the hard part. The hard part is touching user state with enough accuracy that the automation feels helpful instead of reckless.
 
-I also left a fallback `INBOUND_INGEST_KEY` path for providers that cannot emit Svix-compatible signatures.
+That means the real requirements are:
 
-## Deterministic company matching
-
-The first pass tries to identify the company without any model call.
+- identify **who** the message is about
+- identify **what kind** of message it is
+- decide whether the system is **confident enough** to act
+- preserve a **correction path** when it is wrong
 
-### Domain normalization
+That last requirement matters as much as the classifier itself.
 
-```typescript
-const MULTI_PART_TLDS = new Set([
-  "co.uk", "co.jp", "co.kr", "com.au", "com.br", "com.cn",
-  "com.mx", "com.sg", "org.uk", "ac.uk", "gov.uk", "edu.au",
-]);
+## Deterministic first
 
-function extractBrand(email: string): string {
-  const domain = email.split("@")[1];
-  const parts = domain.split(".");
-  const lastTwo = parts.slice(-2).join(".");
+The system works because most of it is deterministic.
 
-  if (MULTI_PART_TLDS.has(lastTwo)) {
-    return parts[parts.length - 3];
-  }
-  return parts[parts.length - 2];
-}
-```
+I did not want the model deciding everything from scratch every time. The product behaves much better when the first passes are simple, inspectable, and cheap:
 
-Company names go through a parallel normalization path: lowercase, strip legal suffixes, remove punctuation, collapse spacing. That lets `"Google LLC"` and `recruiting@google.com` resolve to the same brand token.
+- verify the webhook
+- identify the user from the forwarding alias
+- normalize sender identity
+- match likely company
+- classify obvious message types
+- reject risky or conflicting cases before they become automatic updates
 
-### Match scoring
+**Only the ambiguous cases need a model.**
 
-```text
-exact domain/name match       -> 1.00
-contains match                -> 0.95
-reverse contains match        -> 0.95
-generic mailbox domain        -> skipped
-```
+That was the right shape for this problem. Email classification sounds like an AI problem until you look at the volume of cases that are repetitive, structured, and better served by rules plus guardrails.
 
-Generic mailbox domains such as Gmail, Yahoo, Outlook, iCloud, and ProtonMail are excluded from this path entirely. If the sender is `hr@gmail.com`, domain matching is not trustworthy enough to act on.
+---
 
-This deterministic pass handled most production traffic and kept inference cost low.
+## How a message actually moves through the system
 
-## Deterministic message classification
+Here is a real path. A recruiter at Stripe sends a rejection email. The user has "Stripe - Senior Engineer" in their pipeline with status "applied."
 
-Once the company is known, the next question is what the email means.
+The webhook arrives with a cryptographic signature. If the signature fails, the message is dropped. If it passes, the system extracts the forwarding alias to identify the user.
 
-I used regex- and phrase-based classification first:
+Next, the sender address `talent@stripe.com` goes through **brand extraction**. The system strips the domain, handles multi-part TLDs correctly (so `amazon.co.uk` resolves to "amazon," not "co"), and normalizes to the brand "stripe."
 
-- Rejection patterns
-- Interview patterns
-- Offer patterns
-- Application-receipt patterns
+Then the subject and body are scanned against **keyword lists** for rejection, interview, offer, and other common message types. This message hits rejection language. Zero hits on anything else. No conflicting signals. Category: rejection. The classifier does not just count hits - it checks for **conflicts**. If the same email contains both rejection and offer language, the system forces manual review instead of guessing which one is right.
 
-Examples:
+The normalized brand is matched against the user's pipeline. The system finds the job, and because it was a domain-level match (not fuzzy text matching), it gets full confidence.
 
-```text
-rejection:
-  "unfortunately"
-  "not moving forward"
-  "decided not to proceed"
-  "another candidate"
-  "position has been filled"
+Confidence is mapped into an **operational tier**: high enough to auto-apply, plausible enough to stage for review, or too uncertain to act on. Each tier has a different product behavior rather than just displaying a number. This message qualifies for auto-apply.
 
-interview:
-  "schedule an interview"
-  "next step in the process"
-  "phone screen"
-  "technical assessment"
-  "availability for"
+But before the auto-apply executes, a **guardrail** fires: is the current job status already something positive like "offer" or "accepted"? If so, a rejection email cannot overwrite it, regardless of confidence. That guardrail exists because one misclassified email should not undo what might be the most important state in the user's pipeline. In this case the job is "applied," so the update goes through.
 
-offer:
-  "job offer"
-  "offer letter"
-  "pleased to offer you"
+The system updates the job to "rejected," records the response timing, and writes a log entry that preserves the previous state. The user sees the update in their pipeline with a **one-click undo**. If they reject it, the job reverts and the log is marked as overridden.
 
-receipt:
-  "application received"
-  "thank you for applying"
-  "application confirmation"
-```
+The whole pipeline ran without a model. The model path exists for cases where the brand cannot be matched deterministically or the email language is ambiguous enough that keyword patterns are not sufficient.
 
-The goal was not perfect language coverage. It was high precision on common cases. If the email was still ambiguous after deterministic checks, it moved to the fallback path instead of forcing a guess.
+---
 
-## Conflict detection
+## Matching and classification
 
-Some emails contain multiple valid signals:
+There are really two separate questions:
 
-```text
-"We won't be moving forward with your application for role A.
-However, we'd love to interview you for role B."
-```
+1. **Which application** does this email belong to?
+2. **What does the email mean?**
 
-Those should not auto-apply anything. The system flags them as conflicts and stages them for manual review.
+The matching path works best when it stays conservative. Domain and brand normalization handle a lot, but there are obvious traps:
 
-That decision matters because the expensive mistake is not "failed to automate." It is "automated the wrong state transition."
+- generic mailbox providers
+- recruiters writing from personal addresses
+- hiring platforms that do not map cleanly to one employer
+- companies with several active roles for the same user
 
-## Model fallback
+The classifier has similar problems. Some messages are easy. Some are mixed. Some are only meaningful in context. Some contain language that points in more than one direction at once.
 
-Ambiguous cases use a fast model to extract:
+That is why the product needs **conflict handling** just as much as it needs confident classification.
 
-- company
-- role title
-- message category
-- raw confidence
+## The fallback model
 
-This path is intentionally narrow. The model is not deciding everything on its own. It is filling in the cases where deterministic rules cannot get to a safe answer.
+The model exists for ambiguity, not for the whole pipeline.
 
-## Guardian confidence recalibration
+When deterministic rules cannot safely resolve company, role, or message category, the fallback path tries to produce a narrower interpretation of what the email likely means. But even there, the result is not treated as self-justifying. It still has to pass through confidence and guardrail logic before it can change state automatically.
 
-Raw model confidence is not stable enough to trust by itself, so I recalibrated it with a second pass I called Guardian:
+That design mattered a lot.
 
-```typescript
-let score = 0;
-if (features.lexical_match) score += 0.30;
-if (features.semantic_match) score += 0.30;
-if (features.structure_match) score += 0.20;
-if (features.logic_consistency) score += 0.20;
+> The useful mental model is not "AI email reader." It is "deterministic triage with model-assisted resolution for the leftover cases."
 
-score = Math.max(0, score - uncertaintyFlags.length * 0.05);
+## Confidence and guardrails
 
-final = score * 0.8 + Math.min(rawConfidence, 0.95) * 0.2;
-```
+The system only feels trustworthy if it **fails in the right direction**.
 
-The key idea was to ask the model for easier-to-verify signals instead of one big "trust me" number. Boolean or near-boolean checks such as "does this contain standard rejection language?" are easier to reason about and easier to audit later.
+That means two things:
 
-From there I mapped confidence into operational tiers:
+- confidence needs to be translated into operational behavior rather than just displayed as a number
+- certain conflicts should block automation entirely
 
-```text
-verified    >= 0.90
-probable    0.70 - 0.89
-uncertain   < 0.70
-```
+In practice, the system behaves much better when it distinguishes between:
 
-Auto-application had a stricter bar than "verified." It required very high confidence and zero guardrail violations.
+- **safe enough** to auto-apply
+- **plausible** but review-worthy
+- **too ambiguous** or too risky to automate
 
-## Role disambiguation
+That matters more than squeezing out a few extra auto-updates. The product earns trust by being conservative where the cost of a wrong state transition is high.
 
-One company can map to several active applications, so the system has to decide which record the email belongs to.
+## Undo and review mattered more than cleverness
 
-The resolver used a staged approach:
+One of the best product decisions in this system was making every automatic change **reversible**.
 
-1. Exact role-title match
-2. Substring containment
-3. Fuzzy similarity
-4. Fallback to the most recent job at that company
+The point of automation here is not to prove that the classifier is brilliant. It is to reduce manual maintenance while keeping the user in control.
 
-Illustrative logic:
+So the product has to preserve:
 
-```typescript
-function disambiguateByRole(jobs, extractedRole) {
-  for (const job of jobs) {
-    if (job.title.toLowerCase() === extractedRole.toLowerCase()) {
-      return { job, score: 1.0 };
-    }
-  }
+- what changed
+- what the prior state was
+- whether the update was automatic
+- whether the user later confirmed, rejected, or overrode it
 
-  for (const job of jobs) {
-    if (
-      job.title.toLowerCase().includes(extractedRole.toLowerCase()) ||
-      extractedRole.toLowerCase().includes(job.title.toLowerCase())
-    ) {
-      return { job, score: 0.9 };
-    }
-  }
-
-  for (const job of jobs) {
-    const sim = similarity(job.title, extractedRole);
-    if (sim > 0.6) return { job, score: sim };
-  }
-
-  return { job: jobs[0], score: 0.5 };
-}
-```
-
-The fallback is intentionally weak. If the resolver reaches that branch without other supporting evidence, the result usually gets staged instead of applied.
-
-## Receipt memory
-
-Receipt emails are low-value in isolation but valuable later. If a rejection comes in from the same domain weeks after an application receipt, the receipt log can narrow the candidate jobs.
-
-I used a lightweight scoring scheme:
-
-```text
-+3 same thread
-+2 strong role-title similarity
-+1 weak role-title similarity or missing role/thread data
-```
-
-If that memory reduced the candidate set to a single job, the system could often avoid a model call entirely.
-
-## Hard guardrails
-
-Some transitions are too risky to automate:
-
-```text
-rejection signal when current status is offer or accepted
-offer and rejection signals in the same email
-interview and offer signals in the same email
-```
-
-In those cases the system records the proposed interpretation but blocks the automatic update.
-
-This was one of the more important product decisions. A system like this does not earn trust by being aggressive. It earns trust by being conservative in the right places.
-
-## Undo support
-
-Every auto-applied update stores the previous job status and an audit record:
-
-```typescript
-{
-  matched_job_id: job.id,
-  staged_status: "rejected",
-  previous_job_status: "applied",
-  status_auto_applied: true,
-  status_auto_applied_at: new Date().toISOString(),
-  staged_confirmed_at: null,
-}
-```
-
-That made it possible to expose a short undo window in the UI. If the classifier got something wrong, rollback was explicit and cheap.
-
-## Recovering the original response date
-
-Forwarded emails are annoying because the provider timestamp reflects the forward, not the original message. To recover real response latency, I parsed provider-specific forwarding formats:
-
-```typescript
-function extractOriginalEmailDate(body: string): Date | null {
-  // Gmail, Outlook, Apple Mail, generic "On Thu, Apr 3..." formats
-  // Original date must precede the forward date
-  // Reject obvious future dates and implausibly old timestamps
-}
-```
-
-That let the system compute actual company response time relative to application date rather than forward time, which was much more useful for downstream analytics.
-
-## Deduplication
-
-I used a five-minute dedup window on `(user_id, sender, subject)` so the same forwarded message would not create duplicate state transitions.
-
-The only major exception was forwarding-confirmation mail from providers. Those need to bypass normal dedup and classification logic because they are part of setup rather than job-state changes.
+That is what turns the feature from a hidden background process into something people can actually trust.
 
 ## Privacy
 
-Raw email bodies are not persisted. The log stores only what is needed to audit decisions:
+I did not want the sync log to become a second mailbox.
 
-- sender
-- subject
-- category
-- matched job
-- confidence
-- match method
-- Guardian features
-- guardrail flags
-- timing metadata
+The system needs enough information to audit decisions and explain behavior, but not so much that it stores full raw message history forever just because the feature can.
 
-That was enough to debug classifier behavior without turning the audit log into a second mailbox.
+> Store enough for accountability. Do not turn the classifier into an excuse for unnecessary retention.
 
-## Results
+---
 
-In practice, deterministic matching plus keyword classification handled the majority of emails. The fallback model mostly existed for personal-email recruiters, hiring platforms, and phrasing that did not fit the rule sets cleanly.
+## Why it works
 
-More importantly, the system failed in the right direction. When it was unsure, it staged. When it was very sure and the guardrails stayed clear, it applied. That balance mattered more than squeezing out a few more automated updates.
+The system works because it is not trying to be maximally autonomous.
+
+The good version of this feature is:
+
+- **deterministic** where possible
+- **model-assisted** where necessary
+- **conservative** on risky transitions
+- **explicit** about confidence
+- **reversible** when it gets things wrong
+
+That is a much better product than a system that boasts about "fully automated job inbox intelligence" and quietly corrupts pipeline state in edge cases.
 
 ## What I would change next
 
-- Split the large Edge Function into smaller classifier and provider modules
-- Expand multilingual phrase support
-- Add better recruiter-platform normalization for domains like Greenhouse and Lever
-- Track calibration drift on the Guardian thresholds over time
+- split the ingestion path into cleaner provider and classification modules
+- improve handling for recruiter platforms and indirect sender identities
+- expand phrase support beyond the current English-first assumption
+- keep tightening calibration between classifier confidence and auto-apply behavior
 
 ## Running it
 
-This is part of [P.A.T.H.O.S.](https://yourpathos.app). The ingestion function lives at `supabase/functions/ghost-listener/index.ts`, and the broader product context is in the [P.A.T.H.O.S. engineering note](https://github.com/thedeutschmark/engineering-notes/tree/main/how-i-built-pathos).
+This is part of [P.A.T.H.O.S.](https://yourpathos.app). The broader product context is in [How I built P.A.T.H.O.S.](../how-i-built-pathos/).

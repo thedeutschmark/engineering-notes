@@ -8,5 +8,6 @@ Technical write-ups on some of the harder problems I came across.
 | [Chat bot memory](chat-bot-memory/) | Persistent memory for a Twitch chat bot without storing raw chat logs | C#, Streamer.bot, Gemini Flash |
 | [Collab detection](collab-detection/) | Multi-signal confidence-ranked collab detection for Twitch | Twitch Helix API, Prisma, PostgreSQL |
 | [How I built P.A.T.H.O.S.](how-i-built-pathos/) | Deterministic ATS scoring, truth-constrained AI rewriting, ghost detection | Supabase, React 19 |
+| [Glass Box transparency](glass-box-transparency/) | Three-layer transparency for persona state, resume optimization, and inbound job intel | React 19, Supabase, Gemini |
 | [Email sync](email-sync/) | Auto-detecting recruiter responses from forwarded emails with Guardian confidence scoring | Supabase Edge Functions, LLM API, Resend |
 | [ML prediction](ml-prediction/) | Logistic regression from scratch, blended with deterministic scoring for job application outcomes | JavaScript, Supabase, PostgreSQL |

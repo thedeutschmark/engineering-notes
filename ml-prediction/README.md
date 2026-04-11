@@ -1,346 +1,149 @@
 # Machine Learning in a Job Search Tool
 
-How I added a learned prediction layer to a job-search product without giving up explainability: logistic regression trained on consented outcome data, calibrated after training, and blended with a deterministic scoring engine instead of replacing it.
+*Adding a learned prediction layer on top of a deterministic scoring engine without giving up transparency or control.*
 
-## The prediction problem
+I added a learned prediction layer to P.A.T.H.O.S. because the deterministic scoring engine was useful but predictably limited.
 
-P.A.T.H.O.S. already had a deterministic Apply Confidence score. It combined ATS match, skill gaps, compensation alignment, and company intelligence into a single number that users could inspect and understand.
+A hand-built score can be transparent, stable, and easy to reason about. It also cannot discover much beyond the interactions I explicitly encoded into it.
 
-That score was useful, but it had a predictable limitation: the weights were hand-tuned. It could not learn that certain feature combinations mattered more than I originally expected unless I encoded those interactions manually.
+The ML layer exists to pick up some of that missing structure **without replacing** the deterministic system underneath it.
 
-The ML layer exists to correct for that. It does not replace the deterministic engine. It supplements it.
+---
 
-```text
-final score = 60% deterministic + 40% model
-```
+## The problem
 
-If the model is unavailable, the deterministic score passes through unchanged.
+The deterministic Apply Confidence score already did a lot of work:
 
-## Two-layer data design
+- ATS alignment
+- gap severity
+- compensation fit
+- company intelligence
+- compliance and review gates
 
-The system uses two information layers:
+That made it explainable, which I cared about. But it also meant the weights were ultimately hand-tuned. If real outcomes suggested the product was underestimating or overestimating certain combinations, the system could only improve as fast as I updated the rules.
 
-```text
-Public corpus layer
-  anonymous aggregates such as company ghost rates,
-  interview rates, and response timing
+That is where the learned layer became useful.
 
-Per-user layer
-  private outcome patterns such as stronger titles,
-  skills, and industry alignment for one user
-```
+## Why I did not let the model take over
 
-The public layer improves shared company intelligence. The per-user layer improves personalization. Both can generate features, but neither requires storing raw resume text or raw job descriptions in training data.
+The product would have been worse if I had simply replaced the deterministic engine with a model score.
 
-## The 30-feature snapshot
+I did not want the user to lose the part they could actually inspect.
 
-Each optimization run produces a numeric feature snapshot. Exactly 30 features, normalized to `[0, 1]` or `[-1, 1]`:
+So the ML layer is deliberately **subordinate**. It can nudge the final score, but it does not erase the baseline logic. The blending is explicit: the deterministic score carries the majority weight, the model acts as a correction. That matters for rollout, for failure handling, and for user trust.
 
-| # | Feature | Type | Normalization |
-|---|---|---|---|
-| 1 | `deterministicApplyConfidenceScore` | continuous | `/100` |
-| 2 | `matchOptimized` | continuous | `/100` |
-| 3 | `matchDelta` | signed | `/50` |
-| 4 | `preservationScore` | continuous | `/100` |
-| 5 | `criticalGapCount` | count | `/6` |
-| 6 | `stretchGapCount` | count | `/6` |
-| 7 | `reciprocalStrengthCount` | count | `/5` |
-| 8 | `applicationInstructionCount` | count | `/10` |
-| 9 | `cleanupReplacementCount` | count | `/10` |
-| 10 | `unsupportedKeywordRisk` | continuous | `/100` |
-| 11 | `antiAiPolicy` | boolean | `{0,1}` |
-| 12 | `reviewRequired` | boolean | `{0,1}` |
-| 13 | `compliancePassed` | boolean | `{0,1}` |
-| 14 | `companyIntelAvailable` | boolean | `{0,1}` |
-| 15 | `companyGhostRate` | continuous | `/100` |
-| 16 | `companyInterviewRate` | continuous | `/100` |
-| 17 | `learningTotalOutcomes` | log count | `log1p(n)/log1p(100)` |
-| 18 | `learningCalibrated` | boolean | `{0,1}` |
-| 19 | `hasSalaryTarget` | boolean | `{0,1}` |
-| 20 | `salaryAboveTargetFloor` | boolean | `{0,1}` |
-| 21 | `compensationScoreDelta` | signed | `/12` |
-| 22 | `learningScoreDelta` | signed | `/10` |
-| 23 | `networkScoreDelta` | signed | `/10` |
-| 24 | `roleLevelScore` | ordinal | `/8` |
-| 25 | `workModelRemote` | boolean | `{0,1}` |
-| 26 | `workModelHybrid` | boolean | `{0,1}` |
-| 27 | `workModelInPerson` | boolean | `{0,1}` |
-| 28 | `companyIntelConfidenceScore` | ordinal | `/3` |
-| 29 | `includeCoverLetter` | boolean | `{0,1}` |
-| 30 | `acceptedSkillsProvided` | boolean | `{0,1}` |
+> The system is better when the learned layer behaves like a correction term rather than like a sovereign judge.
 
-The important constraint is what is not there:
+---
 
-- no raw resume text
-- no raw job descriptions
-- no company names in the exported training payload
-- no personal identifiers
+## The feature space
 
-At runtime the system may still carry a normalized company string for display or debugging, but the export path strips it before training:
+The model sees a structured feature vector derived from optimization runs and downstream outcomes. Not raw resumes and job descriptions.
 
-```sql
-mp.feature_snapshot - 'companyNormalized' AS feature_snapshot
-```
+That choice was partly about privacy and partly about control. Feature-based training gives a cleaner interface between product logic and model training. It also makes it easier to reason about what the model is actually being allowed to learn from.
+
+The features fall into a few categories:
+
+**Optimization signals** - the direct output of the ATS engine: match quality before and after optimization, how much the match improved, how much original voice was preserved, hard and soft skill gap counts, and fragile keyword risk.
+
+**Company intelligence** - aggregate data from the network: ghost rate, interview rate, and a confidence score reflecting how much data backs the intel for that company.
+
+**User history** - per-user learning signals: how many tracked outcomes the user has, whether they have enough outcomes to be statistically meaningful, and how much their personal history is adjusting the score.
+
+**Context signals** - job and application metadata: seniority level, work model flags, whether the user set compensation expectations, and whether the job meets them.
+
+Every feature is normalized to a consistent range before training. Count features use fixed denominators rather than data-driven normalization so the feature space does not shift between training runs.
 
 ## Why logistic regression
 
-The task is binary: does this application eventually produce a positive outcome or not?
+Logistic regression was the right first model for this problem.
 
-For the dataset size and feature set I had, logistic regression was the right starting point:
+Not because it is glamorous. Because it **matched the maturity of the data and the product**.
 
-- interpretable coefficients
-- calibrated probability output after post-processing
-- fast training and cheap inference
-- strong baseline behavior with a modest number of numeric features
+The task is binary (positive outcome vs. negative). The feature space is structured. The dataset is meaningful but not massive. The rollout needs to be controlled. The output needs to be interpretable enough that I can compare it sensibly against the deterministic baseline.
 
-I could have reached for a more expressive model, but the cost would have been weaker interpretability and a less controlled first deployment.
+Training uses standard gradient descent with learning rate decay and L2 regularization to keep the weights from overfitting to sparse features. Class weighting uses inverse frequency so the model does not just learn to predict the majority class.
 
-## Training from scratch
+A more expressive model might eventually beat it. That was not the point of the first deployment.
 
-The model is implemented in plain JavaScript in `scripts/lib/mlPipeline.js`.
+---
 
-Training uses full-batch gradient descent with L2 regularization:
+## Calibration mattered as much as ranking
 
-```javascript
-trainLogisticRegression({
-  X,
-  y,
-  epochs: 1600,
-  learningRate: 0.08,
-  l2: 0.001,
-})
-```
+I cared less about the model sounding sophisticated and more about whether its output **behaved responsibly** inside a product.
 
-There are a few practical safeguards in the training loop:
+A model that sorts examples reasonably well but produces unstable probability estimates is awkward inside a user-facing score. If the model says 0.72 for one application and 0.74 for another, those numbers need to mean something stable enough to display.
 
-- class balancing so the model does not collapse toward the majority negative class
-- logit clamping to avoid sigmoid overflow
-- probability clipping to avoid `log(0)`
-- L2 regularization on weights only, not the intercept
-- learning-rate decay every 400 epochs
+The system uses **Platt scaling** on a held-out calibration pool that the logistic regression never saw during training. The data is split chronologically into three pools: training, calibration, and holdout evaluation, always ordered oldest to most recent.
 
-Class balancing in particular mattered. In job-search data, negative outcomes are common enough that an unbalanced model can achieve passable accuracy by being pessimistic all the time. That is not useful product behavior.
+Platt scaling fits a two-parameter transform on the raw logits using the calibration pool. The result is a calibrated probability that better reflects the actual observed outcome rate at each confidence level.
 
-## Platt scaling
+That requirement pushed the system toward a more careful pipeline than I would have needed for a purely internal ranking model.
 
-Raw logistic-regression output is not guaranteed to be well calibrated even when ranking is decent, so I fit a second-stage calibration layer with Platt scaling:
+## Time-aware evaluation
 
-```javascript
-fitPlattScaling({
-  logits,
-  labels,
-  epochs: 800,
-  learningRate: 0.05,
-  l2: 0.0001,
-})
+One thing I cared about early was evaluating the model in a way that actually resembled the product.
 
-// inference
-calibratedLogit = rawLogit * slope + intercept
-probability = sigmoid(calibratedLogit)
-```
+> The real task is not "predict a random held-out row." It is "predict future outcomes from past data."
 
-The important part is the split: Platt scaling is fit on a calibration set, not the same rows used to train the base model.
+That is why the split is chronological rather than random. The holdout set is always the most recent slice of labeled data, so evaluation metrics reflect the model's ability to generalize forward in time rather than interpolate within a shuffled dataset.
 
-## Time-aware data split
-
-The data split is chronological:
-
-```text
-oldest 60% -> train
-next 20%   -> calibration
-newest 20% -> holdout
-```
-
-That matters more than it sounds. A random split can leak temporal structure and make the model look better than it really is. In production, the task is always "predict future outcomes from past outcomes," so the evaluation split should mirror that.
-
-## Feature stability filtering
-
-Before training, features with near-zero variance are removed. Constant columns add noise and can create numerical instability without carrying information.
-
-That filter became useful as the feature set evolved. Some signals are common in one product phase and nonexistent in another. The pipeline handles that automatically instead of assuming every column is always meaningful.
-
-## The deterministic engine underneath the blend
-
-The model only owns 40% of the final score because the deterministic engine carries the explanation layer.
-
-At a high level, the deterministic score combines:
-
-- ATS match
-- critical and stretch skill gaps
-- reciprocal strengths
-- compensation alignment
-- learning history when sample size is sufficient
-- company and network intelligence
-- review and compliance gates
-
-The result is a score users can inspect:
-
-```text
-strong ATS match            +22
-2 critical skill gaps       -28
-company ghosts frequently    -8
-final deterministic score    62
-```
-
-That is the piece the user can reason about directly. The model is there to nudge the score when historical outcomes suggest the hand-tuned weights are missing something.
-
-## The 60:40 blend
-
-The blend is intentionally simple:
-
-```javascript
-const blendedScore = Math.round(
-  deterministicScore * 0.6 + modelScore * 0.4
-);
-```
-
-If the deterministic score says `72` and the model score says `58`, the user sees `66`. The learned layer can pull the result up or down, but it cannot erase the explainable baseline.
-
-That design also made rollout safer. If inference fails, the product still behaves in a familiar way.
-
-## Inference path
-
-There are two inference routes and one graceful fallback:
-
-```text
-client request
-  -> Edge Function inference path
-  -> direct RPC fallback
-  -> deterministic-only fallback if neither is available
-```
-
-The database RPC handles the actual dot product, calibration transform, and sigmoid evaluation inside Postgres. That keeps the prediction surface small and makes it easier to use the same active model artifact from more than one runtime path.
-
-## Publication gate
-
-A trained model does not go live automatically. It has to clear a promotion gate relative to the deterministic baseline:
-
-```javascript
-const signals = [
-  comparison.aucRocDelta >= 0.01,
-  comparison.brierImprovement > 0.003,
-  comparison.logLossImprovement > 0.01,
-  comparison.eceImprovement > 0,
-];
-
-const recommended =
-  signals.filter(Boolean).length >= 2 &&
-  comparison.aucRocDelta >= -0.01;
-```
-
-That gate asks for improvement on at least two useful dimensions while rejecting models that materially degrade ranking quality.
-
-The metrics are:
-
-- `AUC-ROC` for ranking quality
-- `Brier score` for probability quality
-- `log loss` for penalizing confident mistakes
-- `ECE` for calibration quality
-
-## Evaluation
-
-AUC-ROC is computed exactly with pairwise ranking rather than an approximation. At the dataset sizes I had, that was still cheap and removed one source of noise from evaluation.
-
-ECE is computed across ten equal-width probability bins. It is not perfect, but it is a practical sanity check for whether predicted probabilities line up with observed outcomes.
-
-I cared about calibration because this score is surfaced to users as advice. If the model says 0.7, it should mean something close to 70% under the conditions where it is used.
+The publication gate requires the model to beat the deterministic baseline on multiple evaluation metrics without materially degrading discrimination. If it does not clear that bar, the product keeps using the deterministic path. **No model is better than a bad model.**
 
 ## Publishing and rollback
 
-Publishing is done through a script:
+Another important decision was treating model promotion as a **gate** instead of an automatic consequence of training.
 
-```bash
-node scripts/publishApplyConfidenceModel.js --artifact latest-training-report.json
-```
+A new model should not become active just because it exists. It should have to outperform the baseline in a way that is actually useful to the product.
 
-The publish flow snapshots the current active model, inserts the candidate artifact, switches activation, and restores the previous model if activation fails. The goal is not a perfect ceremony. It is a practical deployment path where a bad activation does not strand the system without an active model.
+Publication is an atomic operation with rollback protection. If the new model fails to activate, the system restores the previous model. The product is never left without an active model.
+
+That discipline matters even more in a system like this because the deterministic engine is already usable. The learned layer has to justify itself. If it does not, the product is not blocked. It simply keeps using the stronger baseline.
+
+---
 
 ## Consent and privacy
 
-Shared-model training is explicit opt-in:
+This was one of the places where I wanted the architecture to **reflect the product promise** rather than decorate it.
 
-```sql
-ALTER TABLE profiles
-  ADD COLUMN shared_training_consent boolean NOT NULL DEFAULT false,
-  ADD COLUMN shared_training_consent_version text,
-  ADD COLUMN shared_training_consent_updated_at timestamptz;
-```
+Shared-model training is opt-in. The training export function only returns rows where the user has consented and the outcome has been labeled. It strips company identifiers before export. Prediction is available to all users, but training contribution requires explicit consent.
 
-Training exports only rows that are:
+The system is designed around structured features instead of raw personal text as the main training unit. Prediction and training eligibility are tracked in a way that can be audited later instead of reconstructed from vibes.
 
-- explicitly consented
-- labeled with an outcome
-- non-empty in feature space
+That does not make the ML layer magically pure. It just means the product is trying to be deliberate about what it learns from and why.
 
-And again, the export path strips company identifiers from the feature payload.
+## Public intelligence versus personal learning
 
-Prediction logs also capture the consent snapshot at prediction time so training eligibility can be audited later instead of inferred retroactively.
+One useful distinction in the system is between:
 
-## Company intelligence
+- **aggregate intelligence** from many users
+- **user-specific patterns** from one person's history
 
-The public corpus feeds daily company and role aggregates such as:
+Those are different kinds of learning and they should not be treated as the same thing.
 
-- ghost rate
-- interview rate
-- response timing
+The aggregate layer is useful for company and market behavior. The personal layer is useful for figuring out what seems to work unusually well or poorly for one user over time.
 
-Those aggregates come with eligibility filters:
+Keeping those ideas separate made the prediction system easier to reason about and harder to overclaim.
 
-- the user must contribute to intelligence
-- the account must be old enough to reduce poisoning risk
-- the application needs enough age and metadata to be meaningful
+---
 
-### k-anonymity and surfacing thresholds
+## Why the system works
 
-Exports enforce a minimum sample size of 10, with a default threshold of 20 for most views. In practice I treated the confidence bands like this:
+The prediction layer works because it does not try to do everything.
 
-| Band | Samples | Surfaced |
-|---|---|---|
-| high | 25+ | yes |
-| medium | 10-24 | yes |
-| none | 0-9 | no |
+It sits on top of an explainable baseline, learns from outcome data, and changes the final score only within a controlled boundary. If inference fails or the active model is not good enough, the product still has a sensible deterministic path underneath it.
 
-That keeps the public layer useful without pretending tiny samples are stable.
-
-### Company normalization
-
-Company names are normalized and, where helpful, mapped through an alias layer:
-
-```text
-"Google LLC"          -> "google"
-"Alphabet"            -> "google"
-"DeepMind"            -> "google"
-"Amazon Web Services" -> "amazon"
-"GitHub"              -> "microsoft"
-"Slack"               -> "salesforce"
-```
-
-That was necessary because otherwise the aggregate layer fragments into several near-duplicate entities and loses value.
-
-## Drift detection
-
-The monitoring layer tracks:
-
-- recent vs training-baseline means for several key features
-- inference failure rate
-- average predicted probability vs observed positive rate
-- obvious miss patterns such as high-score negatives and low-score positives
-
-The point is not advanced MLOps. It is enough monitoring to tell when the model is becoming misaligned with the live product.
-
-## Benchmark support
-
-I also wired in a Kaggle resume dataset for benchmark and fixture generation. That does not replace real outcome data, but it is useful for stress-testing extraction quality, deterministic scoring paths, and regression behavior without waiting for live traffic to accumulate.
+That is the right balance for this stage of the system.
 
 ## What I would change next
 
-- add a validation split with early stopping instead of fixed epochs
-- introduce a small set of explicit interaction features
-- test a tree-based model once the dataset is materially larger
-- add temporal features for hiring seasonality and macro conditions
+- add a more explicit validation-and-early-stopping path for training
+- test a stronger model family once the dataset is materially larger
+- keep improving interaction and temporal features without making the feature space opaque
+- tighten monitoring around calibration drift as the product evolves
 
-I still think logistic regression was the right first model. It matched the maturity of the data and the need for controlled rollout.
+I still think the first model was the right one. The point was not to build the fanciest predictor. The point was to add learned correction without giving up control.
 
 ## Running it
 
-This is part of [P.A.T.H.O.S.](https://yourpathos.app). The training and inference code lives in `scripts/lib/mlPipeline.js`, `scripts/trainApplyConfidenceModel.js`, `supabase/functions/ml-inference/index.ts`, `src/utils/applyConfidence.js`, and `src/utils/mlTelemetryPayload.js`.
+This is part of [P.A.T.H.O.S.](https://yourpathos.app). The broader product context is in [How I built P.A.T.H.O.S.](../how-i-built-pathos/).

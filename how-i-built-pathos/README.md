@@ -1,492 +1,252 @@
 # How I Built P.A.T.H.O.S.
 
-P.A.T.H.O.S. started from a simple observation: job-search tooling is full of opaque scoring, generic AI rewriting, and pipeline trackers that stop being useful the moment the inbox gets messy. I wanted something more rigorous. The scoring should be explainable, the rewriting should stay truthful, and the product should reflect what the market actually feels like instead of pretending the process is cleaner than it is.
+P.A.T.H.O.S. started from a simple frustration: most job-search tools either give you generic AI polish or they give you a tracker that falls apart the moment the process gets messy.
 
-## The problem I was trying to solve
+I wanted something stricter than that.
 
-Modern hiring stacks are fragmented. Applicants write for recruiters, parsers, scoring rules, and AI filters at the same time. Most tools in this space react by adding even more opacity:
-
-- a black-box "ATS score" with no explanation
-- AI rewriting that sounds generic after one pass
-- pipeline tracking that depends on the user manually updating every response
-
-I wanted the opposite:
-
-1. A scoring system I could explain line by line
-2. An AI layer constrained hard enough that it could improve wording without inventing substance
-3. Support systems for the two biggest sources of wasted effort: ghost jobs and missed inbox signals
+The score needed to be explainable. The rewriting needed to stay inside the truth. The system needed to account for ghosting, weak listings, recruiter latency, and the fact that most users are navigating a high-friction process rather than a neat funnel.
 
 That became P.A.T.H.O.S., short for Personal Automated Tracking & Hiring Optimization System.
 
-## Design principles
+## The problem I was trying to solve
 
-Three principles shaped the product from the beginning:
+Modern hiring stacks are fragmented. Applicants are writing for recruiters, parsers, ranking heuristics, and increasingly AI-assisted review systems at the same time.
+
+Most products respond by adding more opacity:
+
+- a black-box ATS score
+- resume rewriting that sounds polished but generic
+- pipeline tracking that assumes the user will manually maintain every state change
+
+I wanted the opposite:
+
+1. deterministic scoring wherever deterministic scoring makes sense
+2. an AI layer that edits rather than fabricates
+3. support systems for the parts of the process that usually waste the most time
+
+## The design rules
+
+Three rules shaped almost every major decision.
 
 ### 1. Deterministic first
 
-If a decision can be made with transparent rules, it should be. That makes debugging easier, auditing possible, and product behavior more stable.
+If a decision can be made with visible rules, that is usually better than hiding it behind a model.
 
-### 2. AI as a constrained editor, not an author
+That does not mean the rules are perfect. It means they can be inspected, tuned, and challenged.
 
-The model can translate, tighten, reorder, and suggest. It does not get to invent work history, credentials, or metrics.
+### 2. AI as a constrained editor
 
-### 3. The product has to acknowledge the real process
+I wanted the model helping with translation, prioritization, and wording, not inventing substance.
 
-A job search is not just resume editing. It is also ghost listings, slow response cycles, buried rejections, and a lot of uncertainty. The system needed to account for that, not just optimize one document in isolation.
+That means the useful AI work is:
+
+- reframing existing experience in the language of the role
+- tightening bullets
+- changing emphasis
+- making the document read more clearly for both humans and systems
+
+The destructive AI work is:
+
+- inventing tools
+- inflating titles
+- fabricating outcomes
+- flattening the user's voice into generic optimizer prose
+
+The whole product is built around trying to stay on the first side of that line.
+
+### 3. The product has to reflect the real process
+
+A job search is not just document editing. It is also inbox noise, weak listings, silent rejection, false hope, and a lot of uncertainty about what actually happened after the application left your hands.
+
+If the product only optimizes the resume, it solves too small a part of the problem.
 
 ## Deterministic ATS scoring
 
-The core score is formula-based:
+The core scoring layer is deliberately formula-driven.
 
-```text
-Score = (KeywordMatch x 0.60) + (SemanticContext x 0.20)
-      + (((Readability + Parseability) / 2) x 0.20)
+I wanted the product to tell the user something more useful than "your ATS score is 82." The number by itself is not interesting. What matters is why the score moved and what kinds of changes are most likely to improve it.
 
-Hard cap: 98
-```
+So the scoring model focuses on a few things that are explainable and usually worth caring about:
 
-The cap is deliberate. A perfect score suggests a level of certainty that is not realistic for resume screening.
+- whether the JD's important terms are present
+- whether they appear in meaningful context rather than only in a list
+- whether the document is easy for a parser to read
+- whether the writing itself is structurally strong enough to survive first-pass review
 
-### Keyword extraction and weighting
+This is not a claim to emulate every real ATS exactly. It is a practical scoring system for resume quality under ATS-like constraints.
 
-Keywords are pulled from the job description and bucketed by salience:
-
-| Category | Signal | Weight |
-|---|---|---|
-| MUST-HAVE | repeated frequently or emphasized in requirements | 5 |
-| SHOULD-HAVE | repeated moderately or emphasized in preferred qualifications | 3 |
-| NICE-TO-HAVE | present but lower emphasis | 1 |
-
-I then weight them by where they appear in the resume:
-
-```text
-summary section         -> 1.5x
-first bullet per role   -> 1.2x
-skills section          -> 1.3x
-everything else         -> 1.0x
-```
-
-This is not a claim that every ATS behaves identically. Different systems parse and rank differently. The point is that some resume locations are consistently more important for both parsing and human review, so the scoring model reflects that.
-
-### Semantic context
-
-Presence alone is not enough. A term in a skills list is weaker than the same term used in evidence-bearing context.
-
-That is what the semantic component measures. `"Python"` under skills is useful. `"Built a Python pipeline processing 2M records/day"` is stronger because it ties the term to an action and an outcome.
-
-### Readability
-
-Each bullet gets scored for features that usually correlate with stronger resume writing:
-
-```text
-action verb present         +25
-quantified result           +35
-ideal length range          +20
-starts with action verb     +20
-```
-
-This is essentially structured writing guidance disguised as a score. Bullets with a clear action and a clear result tend to read better whether a human or parser sees them first.
-
-### Parseability
-
-Parseability starts from a baseline and adds or subtracts based on structure:
-
-- expected sections present
-- consistent bullets
-- plain text that survives parser extraction
-- penalties for formatting choices that commonly break parsing or degrade extraction quality
-
-This is the least glamorous part of the system and one of the most useful. A technically strong resume can still lose information if the parser output is messy.
+That distinction matters.
 
 ## AI rewriting without fabrication
 
-The deterministic score tells the user what changed and why. The AI layer exists to help with the wording, not to replace judgment.
+Once the deterministic layer is in place, the AI layer becomes more useful because it has a narrower job.
 
-### Truth constraints
+I do not need the model to invent qualifications. I need it to improve how existing qualifications are presented.
 
-The prompt allows:
+That means the optimizer is designed around two constant tensions:
 
-- translating existing experience into job-description language
-- tightening bullets
-- reordering emphasis
-- inferring a small number of directly supported skills
+- improve alignment without making false claims
+- improve language without erasing the user's own voice
 
-The prompt forbids:
+Those tensions are the whole product, really.
 
-- adding unsupported tools or frameworks
-- changing dates, titles, employers, or education
-- inventing outcomes or metrics
+If the model gets too conservative, the output is timid and unhelpful. If it gets too aggressive, the output becomes false, generic, or both.
 
-That boundary matters. Resume optimization becomes useless the moment the model starts making the candidate sound more qualified than the record supports.
+So a lot of the work in P.A.T.H.O.S. is really about guardrails:
 
-### Voice preservation
+- preserving role identity
+- preserving factual claims
+- filtering cliché-heavy AI language
+- keeping generated output close enough to the author's original voice to still feel authored
 
-Before rewriting, the system extracts a lightweight voice profile from the original resume:
+I think that is a much better frame than "resume generation." It is closer to constrained transformation.
 
-```javascript
-{
-  avgSentenceLength: 14,
-  avgBulletLength: 16,
-  usesMetrics: true,
-  actionVerbs: ["built", "designed", "led"],
-  technicalDensity: "high",
-  toneProfile: "confident-technical",
-  passiveVoiceRate: 0.08,
-  specificityScore: 0.65,
-  flaggedJargon: ["synergy"],
-}
-```
+## Brand Voice and Voice & Style
 
-That profile gets fed back into the rewrite prompt so the output stays recognizably close to the original author.
+One thing I did not want was a system that optimized everyone into the same tone.
 
-I did not want "optimization" to mean "flatten everything into generic AI prose." If the original resume is terse and technical, the rewritten version should still feel terse and technical.
+The product ended up with a `Voice & Style` layer because voice preservation is not a cosmetic feature. It is part of whether the result still feels credible.
 
-### Brand Voice and Voice & Style
+The useful version of this is not "let the user write a massive style prompt." It is extracting a compact style profile from real writing samples and then using that as a boundary condition on later generation.
 
-That same system extends into the app's `Voice & Style` surface. Users can provide raw writing samples, and the system extracts a compact "Brand Voice Directive" that gets fed back into generation.
-
-The point is not to let users write a giant style prompt. It is to derive something narrower and more usable:
-
-- sentence length and cadence
-- tone and formality
-- jargon tolerance
-- directness vs narrative style
-
-In product terms, this shows up as Brand Voice. In implementation terms, it is a constrained style layer sitting on top of the same truth-preserving optimizer.
-
-### Verb control and cliché filtering
-
-One failure mode in this category is overcorrection. A weak bullet becomes a cartoonishly aggressive bullet because the system keeps escalating the verb.
-
-To avoid that, the rewrite pass tracks weak and strong verb usage, but it also blocks cliché-heavy language and overblown phrasing. Terms like `synergy`, `leverage`, `paradigm`, `move the needle`, and similar filler get flagged explicitly.
-
-The goal is not "more intense." It is "clearer, more specific, still believable."
-
-### Bullet validation
-
-Each bullet is checked against a simplified STAR-style structure:
-
-```javascript
-{
-  score: 3,
-  maxScore: 4,
-  components: {
-    hasSituation: true,
-    hasTask: false,
-    hasAction: true,
-    hasResult: true
-  },
-  missing: ["task"],
-  isValid: true
-}
-```
-
-I do not require every bullet to contain every STAR element. That would force unnatural writing. What I care about most is whether the bullet clearly says what happened and what changed.
+The goal is simple: if a user is naturally terse, technical, and evidence-heavy, the optimized output should not suddenly sound like a motivational LinkedIn post.
 
 ## Graceful degradation
 
-The product is designed so the useful part still works even if the model path is unavailable:
+I cared a lot about the product still being useful when the model path is unavailable or not the right tool.
 
-```text
-Tier 1: full AI      -> complete optimization
-Tier 2: partial AI   -> simplified rewrite path
-Tier 3: local only   -> deterministic scoring and guidance
-```
+That led to a layered approach:
 
-That meant a user could still get meaningful feedback from local extraction, keyword matching, and structural analysis even if the external model call failed.
+- deterministic analysis and guidance should still stand on their own
+- model-assisted rewriting should improve the system, not define the entire product
+- failure in one layer should not make the whole experience collapse
 
-It also affected billing. Credits are deducted after a successful response, not before. If an upstream call fails, the user should not pay for the failure mode.
+This ended up mattering for user trust as much as for architecture. A product feels much more reliable when it can degrade into a simpler truthful mode instead of simply failing.
 
-## Glass Box transparency and Advanced Mode
+## Glass Box transparency
 
-One of the product ideas that kept surviving iteration was what the landing page now calls `Glass Box Transparency`.
+One of the ideas that became more important over time was what the product calls `Glass Box Transparency`.
 
-Most resume tools hide their reasoning. I wanted the opposite. When the optimizer runs, the app exposes a live process view of what it is doing: parsing the job description, extracting weighted keywords, identifying gaps, generating rewrites, and checking the result against its guardrails.
+The short version is that I did not want the system making consequential changes in silence.
 
-That matters for two reasons:
+The longer version is that there are really three different Glass Boxes in the app:
 
-1. It makes the system easier to trust.
-2. It makes debugging much easier when the output is wrong.
+- the persona layer
+- the optimizer and its multi-stage process
+- the inbound intelligence layer
 
-This is also where `Advanced Mode` fits. Standard mode is optimized for speed. Advanced Mode exposes more of the review surface, especially around skill verification and generation control, so users can intervene earlier instead of only inspecting the final output.
+That distinction matters because each surface is answering a different trust question.
 
-I did not want "transparent AI" to mean a vague explanation after the fact. I wanted a working surface that shows the system's reasoning while the job is in progress.
+I go into that in more detail in [Glass Box transparency](../glass-box-transparency/), but the basic point is simple: transparency should show the user enough of the basis for action that the system feels inspectable without dumping raw internals or pretending to reveal some magical private chain of thought.
+
+That ended up being especially important in the optimizer, where the system is moving through multiple stages of analysis, inference, generation, and review.
 
 ## The ATS visibility gap
 
-One part of the landing page is built around a blunt claim: applicant-tracking systems are optimized to reduce recruiter workload, not to identify the best candidate in any deep or holistic sense.
+One of the framing choices on the landing page is that the product does not start from reassurance. It starts from the fact that hiring systems are structurally messy.
 
-That section exists because I did not want the product to start from fake reassurance. If the user is struggling, the system should name the actual terrain first.
+That matters because the product only makes sense if you accept the environment it is built for:
 
-The three reference points behind that section are doing different jobs.
+- ATS software is now normal infrastructure, not an edge case
+- screening systems often exclude qualified people for procedural reasons
+- application volume can rise faster than actual hiring
+- ghosting and recruiter overload distort the process even when the market is not uniformly collapsing
 
-### 1. ATS prevalence
+That is why P.A.T.H.O.S. is not just a resume optimizer. It is trying to help the user operate inside a process that is noisy, crowded, and often indifferent to nuance.
 
-The first point is simple: ATS usage is not edge-case infrastructure anymore. It is the default operating environment for corporate hiring.
+The public sources I use in the paper are there to ground that claim, not to inflate it.
 
-The landing page references [Jobscan's ATS usage report](https://www.jobscan.co/blog/fortune-500-use-applicant-tracking-systems/) for that reason. I am not using it to claim every employer screens the same way. I am using it to establish the baseline fact that a large share of hiring funnels pass through ATS software before a recruiter reviews anything meaningful.
+## Ghost-job detection
 
-That matters because it changes the product requirement. If the resume is not parseable, structurally legible, and keyword-aligned enough to survive early filtering, better writing further down the document does not help. That is why P.A.T.H.O.S. starts with deterministic ATS analysis instead of jumping straight to generation.
+One of the obvious ways job seekers waste time is by pouring effort into listings that are weak, stale, or structurally suspicious.
 
-### 2. Hidden-worker exclusion
+The ghost-job layer exists to score risk, not to declare that a listing is fake with total certainty.
 
-The second point comes from [Harvard Business School and Accenture's Hidden Workers research](https://www.hbs.edu/managing-the-future-of-work/research/Pages/hidden-workers-untapped-talent.aspx).
+That distinction is important.
 
-That reference matters less as a resume statistic and more as a systems argument. It supports the idea that hiring pipelines frequently exclude qualified candidates for structural reasons: overly rigid filters, proxy requirements, fragmented screening logic, and process choices that optimize throughput over judgment.
+The product is looking for patterns that correlate with low-signal or low-trust listings:
 
-That is the philosophical center of the product. The goal is not to game hiring with fabricated credentials. The goal is to reduce avoidable exclusion by translating real experience into forms the pipeline is more likely to recognize.
+- vague evergreen language
+- weak specificity
+- contradictory expectations
+- signs that the posting is more of a funnel than an actively staffed role
 
-### 3. Market pressure and volume
+I wanted that feature to feel like a warning system, not a conspiracy engine.
 
-The third point is [BLS JOLTS](https://www.bls.gov/jlt/), which gives macro labor-market context around openings, hires, and churn.
+## Job Status Sync
 
-On its own, JOLTS does not tell you how one ATS ranks one resume. What it does provide is grounding for the broader claim that the market is noisy, high-volume, and uneven. It helps anchor the product against real labor-market movement rather than turning the whole story into anecdote.
+The other big support layer is the inbound email system, surfaced in the product as `Job Status Sync`.
 
-In practice, that macro context combines with what users see in the app itself:
+I added this because manual pipeline tracking is one of the first things users abandon. The more applications they submit, the less likely they are to keep every state updated by hand.
 
-- longer response cycles
-- more silent applications
-- more competition per posting
-- more need to prioritize where effort actually goes
+So the system watches for inbound recruiter signals, tries to classify them, matches them back to the right application, and gives the user a correction path when the automation is wrong.
 
-That is why the product is not just a resume editor. It also tracks the pipeline, flags ghosting risk, intercepts inbound signals, and tries to narrow attention onto the applications most worth pursuing.
-
-### Why that landing-page section matters
-
-I wanted that section to do three things before the user ever signs up:
-
-1. explain that their difficulty may be structural, not purely personal
-2. justify why the product begins with ATS visibility and pipeline intelligence
-3. make it clear that the system is built for a hostile market, not an idealized one
-
-Without that framing, the rest of the product can sound like any other optimizer. With it, the architecture makes more sense: deterministic scoring, truth-constrained rewriting, Glass Box transparency, ghost detection, and Job Status Sync all become responses to the same underlying problem.
-
-### What the market reports are actually saying
-
-The broader market framing is also grounded in three recurring external sources that the app uses for its benchmark layer.
-
-#### Greenhouse: candidate experience is breaking down
-
-The [Greenhouse 2024 State of Job Hunting report](https://www.greenhouse.com/blog/greenhouse-2024-state-of-job-hunting-report) is useful because it describes the hiring market from the candidate side rather than from the employer-system side alone.
-
-A few points from that report line up directly with why P.A.T.H.O.S. exists:
-
-- the report says `79%` of U.S. workers surveyed felt heightened anxiety in the current job market
-- `61%` said they had been ghosted after a job interview
-- Greenhouse also reported recruiter workload rising `26%` in the prior quarter
-- `38%` of job seekers reported mass-applying to roles
-- Greenhouse says `18-22%` of jobs posted on its platform in a given quarter were classified as ghost jobs
-
-That combination matters. It is not just that candidates are stressed. It is that candidate experience degrades when recruiter load increases and application volume spikes. That is exactly the environment where ghosting rises, signal quality drops, and a tool that only rewrites resumes is not enough.
-
-#### LinkedIn: the market can improve month to month and still stay harder year over year
-
-The [LinkedIn Workforce Report, January 2024](https://economicgraph.linkedin.com/resources/linkedin-workforce-report-january-2024) is useful because it gives a macro hiring snapshot rather than just anecdotal job-search sentiment.
-
-The January 5, 2024 report notes that U.S. hiring increased `5.5%` in December 2023 compared with November 2023, but was still down `9.9%` compared with December 2022. That is the kind of mixed market signal I wanted the product to respect.
-
-The point is not "the market is always getting worse." The point is that localized improvement does not automatically make the funnel easier for individual candidates. A market can show short-term hiring gains while still being crowded, inconsistent, and difficult to navigate. That is part of why the app tracks pipeline state and timing instead of treating every application as an isolated document exercise.
-
-#### iCIMS: competition is rising even when hiring is not collapsing
-
-The [iCIMS January 2025 Workforce Report](https://www.icims.com/company/newsroom/januaryinsights2025/) adds another piece of the picture: competition per opening.
-
-Their January 2025 report says:
-
-- applications were up `13%` from the end of 2023
-- applicants per opening rose `11%`
-- job openings were up `3%`
-- hires were down `1%`
-
-That pattern is important. You can have stable or slightly improving openings and still make the market meaningfully harder for candidates if application volume rises faster than hiring does.
-
-That is exactly the kind of environment P.A.T.H.O.S. is designed for. The product assumes the user is operating inside a crowded funnel where better targeting, clearer ATS visibility, ghost detection, and faster response handling all matter because brute-force applying gets less efficient as applicants-per-opening rises.
-
-## Ghost job detection
-
-A lot of wasted effort happens before the application is even submitted. Some listings are stale, some are soft evergreen roles, and some are written so vaguely that they should be treated cautiously.
-
-The ghost-job detector scores listings from 0 to 100 using deterministic patterns:
-
-### Language signals
-
-- future-opportunity phrasing
-- "always hiring" or evergreen language
-- language suggesting the role is paused, internal, or not actively hiring
-
-### Structural signals
-
-- too few concrete responsibilities
-- unusually generic copy
-- high buzzword density with little operational detail
-
-### Contradiction checks
-
-- entry-level framing with implausibly senior expectations
-- compensation and seniority mismatches
-
-The output is not "this job is fake." It is "this listing carries a higher risk profile than average." That framing is more honest and more actionable.
-
-## Ghost Listener: inbox state without manual tracking
-
-The second large system inside P.A.T.H.O.S. is the [inbound email sync pipeline](https://github.com/thedeutschmark/engineering-notes/tree/main/email-sync). In the product, this is surfaced as `Job Status Sync`.
-
-Users forward recruiter mail to a private alias. The system then:
-
-- verifies webhook authenticity
-- matches sender and company
-- classifies the message
-- applies or stages a job-status update
-- stores an audit trail without keeping the raw body
-
-Most of that path is deterministic. The fallback model exists for ambiguity, not as the default strategy.
-
-### Response latency intelligence
-
-The email system also recovers original message timestamps from forwarded-message headers. That makes it possible to measure actual company response latency rather than the time the user forwarded the mail.
-
-Those timings feed back into company intelligence:
-
-- extremely fast rejections often indicate automated filtering
-- multi-week silence is useful ghosting signal
-- response-time distributions help users calibrate expectations by company
-
-The dashboard side of this system matters too. The app does not just update status quietly in the background. It exposes the event stream, confidence level, match method, and override path so the user can see what was intercepted and correct it when needed.
+That last part matters more than the automation itself. Auto-classification without a visible correction path is just another black box.
 
 ## The companion layer
 
-Most job-search software either ignores the emotional side of the process or responds with generic encouragement. I did not want either extreme.
+I also did not want the product to act like a generic assistant pasted onto a dashboard.
 
-P.A.T.H.O.S. has three response modes:
+The companion layer exists because tone affects whether the product feels steady, irritating, useful, or fake. But I wanted that layer to be controlled, not improvisational.
 
-- `Lite`: minimal and functional
-- `Professional`: direct, strategic, and less chatty
-- `Untethered`: sharper and more opinionated, but still bounded
+So the persona is bounded. It can be direct. It can be sharp. It can respond differently by mode. But it is still there to support the rest of the system, not to become the system.
 
-The implementation is not "let the model improvise personality." Most responses are template-driven with variable substitution and only a light synthetic pass on top. That keeps tone more stable and makes novelty easier to manage.
-
-### Tone control
-
-I used a hostility-budget system so the voice does not jump from mild to abrasive without context:
-
-```text
-onboarding   -> low ceiling
-ramping      -> moderate ceiling
-full mode    -> full range
-```
-
-There is also a safety valve that pulls the tone down when the system sees distress signals such as repeated rejections or sudden pipeline collapse.
-
-The point was not to build a mascot. It was to build a voice that could be blunt without becoming chaotic.
+That is why I think of it as a companion layer rather than as a chatbot feature.
 
 ## Learning from outcomes
 
-Once the system has enough application outcomes, it starts looking for user-specific patterns:
+Once enough application outcomes exist, the product can start looking for signals that are specific to that user rather than generic to the market.
 
-- skills that correlate with better interview rates
-- titles or industries that perform unusually well
-- writing patterns associated with stronger results
+That is where the system becomes more than a one-shot optimizer.
 
-Those insights are gated by a Wilson score lower bound so the system does not overreact to tiny samples:
+The interesting part is not "machine learning" in the abstract. The interesting part is whether the app can notice that some patterns appear to correlate with better outcomes for this user and then use that information carefully, without overreacting to tiny samples or turning noise into policy.
 
-```text
-lb = (p + z^2/2n - z*sqrt(p(1-p)/n + z^2/4n^2)) / (1 + z^2/n) x 100
-```
-
-That matters because "50% interview rate" means very different things at `n = 2` and `n = 40`.
-
-When the confidence gate passes, the optimizer can prioritize genuinely useful personal signals instead of treating every job description as a fresh start.
+That is the line I try to hold there: useful adaptation without false certainty.
 
 ## Task Board and Daily Missions
 
-Once the pipeline, ghost detection, and outcome data existed, it made sense to stop treating the app as a passive tracker.
+Once the product had scoring, pipeline state, inbox signals, and outcome learning, it made sense to turn some of that into action.
 
-That is where the `Task Board` and `Daily Missions` layer came from. Instead of showing users a static list of applications, the system generates next actions from live state:
+That is what the `Task Board` and `Daily Missions` layer is really doing. It is not just listing work. It is trying to convert a noisy background system into a smaller set of actions that are worth doing now.
 
-- follow up with applications approaching a ghost threshold
-- apply now when the user's response patterns suggest a better send window
-- prioritize cleanup or profile work when the pipeline is thin
-- surface setup milestones for incomplete account state
-
-Under the hood this is a scoring problem, not a checklist. Missions are ranked by urgency, impact, freshness, and ML relevance. The result is that the app can turn a messy pipeline into a smaller set of actions worth doing today.
-
-This ended up being one of the more useful product layers because it translated all the background analysis into an actual operating cadence.
-
-## Prompt-injection defense
-
-Job descriptions are user-supplied input embedded in prompts. That makes them a natural prompt-injection vector.
-
-To reduce that risk, the system strips common injection patterns before prompt construction:
-
-- direct instruction overrides
-- system-prompt extraction attempts
-- role hijacking phrases
-- jailbreak patterns
-- encoding or decode tricks
-
-The sanitized content is then embedded inside tagged sections treated as data, not instructions.
-
-This is not a perfect security boundary, but it is an important hardening step when the prompt includes untrusted text.
-
-## Data handling and sovereignty
-
-The public product language leans on privacy and data sovereignty, so the architecture had to support that in a defensible way.
-
-The practical rules are straightforward:
-
-- keep raw sensitive inputs only where operationally necessary
-- encrypt long-lived account data at rest
-- transmit over TLS
-- separate personal learning from shared aggregate intelligence
-- make export possible instead of trapping user history inside the product
-
-Not every feature is local-first, and I would not overclaim that. But the system is designed to minimize unnecessary retention and to keep the shared intelligence layer de-identified rather than user-exposed.
+That ended up being one of the most practical parts of the app because it closes the loop between analysis and behavior.
 
 ## What worked
 
 The pieces that held up best were the ones built around explicit constraints:
 
 - deterministic scoring instead of opaque scoring
-- AI rewriting with hard truth boundaries
+- AI as a constrained editor instead of a free author
 - Glass Box transparency instead of post-hoc handwaving
-- Brand Voice as a constrained style layer instead of generic personalization
-- inbox automation with guardrails and undo support
-- Task Board / Daily Missions as an action layer on top of the pipeline
-- company intelligence grounded in response and listing behavior rather than one-off anecdotes
+- style preservation instead of generic personalization
+- inbox automation with review and correction paths
+- a task layer built on live state rather than static reminders
 
-Those choices made the system easier to explain and easier to trust.
+Those choices made the product easier to explain and, more importantly, easier to trust.
 
 ## What I would change next
 
-- add stronger feedback loops on ghost-job warnings and false positives
-- decay learning signals by recency instead of treating old wins and recent wins equally
-- expand multilingual keyword and pattern support
-- continue breaking the larger subsystems into smaller modules with clearer ownership boundaries
+- make the learning layer more recency-aware
+- improve false-positive handling in ghost-job warnings
+- keep tightening the boundary between strong rewriting and overreach
+- continue breaking larger subsystems into clearer product modules
 
 ## External references
 
-These are representative public references that informed both the framing of the product and parts of the landing-page research layer. They are not the only inputs to the system, but they ground the paper in the same outside sources the app already points to.
+These are representative public references that informed the framing of the product and the market conditions it is built around.
 
 ### ATS and hiring-friction references
 
 - [Jobscan, 2025 Applicant Tracking System (ATS) Usage Report](https://www.jobscan.co/blog/fortune-500-use-applicant-tracking-systems/)
-  Used for ATS prevalence context, including Fortune 500 ATS adoption and common platform distribution.
 - [Harvard Business School + Accenture, Hidden Workers: Untapped Talent](https://www.hbs.edu/managing-the-future-of-work/research/Pages/hidden-workers-untapped-talent.aspx)
-  Useful background on how hiring processes and screening systems systematically exclude qualified candidates.
 - [U.S. Bureau of Labor Statistics, JOLTS](https://www.bls.gov/jlt/)
-  Baseline labor-market reference for openings, hires, quits, and broader market movement.
 
 ### Additional market context used in the app's benchmark layer
 
 - [Greenhouse, 2024 State of Job Hunting report](https://www.greenhouse.com/blog/greenhouse-2024-state-of-job-hunting-report)
-  Used for candidate-experience context around ghosting, recruiter overload, application flooding, and ghost jobs.
 - [LinkedIn Economic Graph, January 2024 Workforce Report](https://economicgraph.linkedin.com/resources/linkedin-workforce-report-january-2024)
-  Used for hiring-rate and labor-market context, especially month-over-month improvement versus year-over-year softness.
 - [iCIMS, January 2025 Workforce Report](https://www.icims.com/company/newsroom/januaryinsights2025/)
-  Used for applicants-per-opening and application-volume pressure in the current hiring market.
-
-Where the product makes stronger operational claims than these public sources support on their own, those claims come from the app's own deterministic logic, telemetry, and user outcome data rather than from third-party research alone.
 
 ## Running it
 
-P.A.T.H.O.S. is live at [yourpathos.app](https://yourpathos.app). The deterministic scoring engine is in `src/utils/atsScoring.js`, prompt logic in `src/utils/aiPrompts.js`, ghost-job detection in `src/utils/ghostJobDetection.js`, and email sync in `supabase/functions/ghost-listener/index.ts`.
+P.A.T.H.O.S. is live at [yourpathos.app](https://yourpathos.app).
