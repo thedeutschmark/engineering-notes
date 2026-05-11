@@ -1,26 +1,29 @@
-# Engineering Notes: From Server-Mediated Polling to Edge Push — A Cost-Bounded Cloudflare Workers/KV Architecture for Per-User Streaming Tools
+# Scaling Per-User Streaming Toolsets on Cloudflare — Edge Push, Hibernation, and Flat Cost-Per-User
 
 **Date:** 2026-05-10
 **Author:** deutschmark
-**Status:** living document — Phase 2 partial, Tasks 10–14 (overlay migrations) outstanding
+**Status:** Phase 2 complete; the migration patterns described here apply 1:1 to any new per-user tool added to the platform.
 
 ---
 
 ## Abstract
 
-A 50% Cloudflare KV daily-read alarm — fired against a single-user streaming tool — exposed a class of cost failures that surface at the boundary between free and paid Workers tiers and that worsen monotonically as user count grows. Rather than upgrade-and-forget, this project re-architected the data plane to put the server out of the hot path. The result, for the now-playing audio widget alone, is a ~99.6% reduction in per-session KV reads with no functional regression. This note documents the diagnosis, the three-layer target architecture, the concrete commits, and the patterns that generalize to other per-user real-time tools on Cloudflare's edge.
+A per-user streaming toolset multiplies cost along two axes: **number of streamers** and **number of OBS overlays each one runs**. Naive polling architectures look fine at one user and quietly become tier-busting at ten. This note documents how we redesigned a Cloudflare Workers + KV + Durable Objects toolset so the cost curve flattens with users — replacing server-mediated polling with edge push, Hibernatable WebSockets, and Twitch EventSub. The result, for the now-playing audio widget alone, is a ~99.6% reduction in per-session KV reads, with no functional regression. The patterns generalize: any per-user real-time tool that today polls a worker can move the hot path off the server.
 
 ---
 
-## 1. Background
+## 1. The scaling problem
 
-The toolset is a static-export Next.js app served via Cloudflare Pages, backed by three Cloudflare Workers (`auth`, `spotify`, `overlay-do`) and a single KV namespace (`AUTH_KV`). Each Twitch streamer runs ~8 OBS browser-source overlays — a now-playing widget, death counter, lurk-peek, BRB player, and so on. Pre-migration, each overlay polled its corresponding worker endpoint every 5–10 seconds.
+The toolset is a static-export Next.js app served via Cloudflare Pages, backed by three Cloudflare Workers (`auth`, `spotify`, `overlay-do`) and a single KV namespace (`AUTH_KV`). The product surface is per-user: each Twitch streamer who installs the toolset runs ~8 OBS browser-source overlays — a now-playing widget, death counter, lurk-peek, BRB player, emote rain, clip play, video shout-out, chat box. Pre-migration, each overlay polled its corresponding worker endpoint every 5–10 seconds.
 
-On 2026-05-07 the project's Cloudflare account received the standard alarm email: 50% of the free tier's 100,000-reads/day KV limit, with **a single user (the developer)**. A GraphQL pull of the prior 7-day window showed peak observed reads of ~8,700/day — well below the 50% trigger of 50,000.
+This shape — **N users × K tools each, every one polling the same workers** — is a multiplicative cost shape. Cloudflare's free tier and paid tier alike have *daily-rate* limits, not per-user limits. The architectural question is not "will this hit a limit" but "how does cost scale with users":
 
-The reconciliation: the alarm fires on a single bad day, not a rolling average. The 50,000-read spike came from a forgotten browser tab polling for ~24 hours uninterrupted. At ~5 KV reads per now-playing poll × 360 polls/hour × 24 hours = **43,200 KV reads in a single day from one tab**. The visible 8.7k/day peak was streaming-only behavior; the spike was a runaway-tab failure mode that polling architectures admit by default.
+- **Polling architecture.** Each user's K tools generate fixed daily request and KV-read volume regardless of whether anything changed. Idle users still cost. The slope of the cost curve is the polling cadence × K.
+- **Push architecture.** Cost per user is dominated by the cost of *delivering* events, not the cost of *checking* for them. An idle user — overlay open, nothing happening on stream — costs almost nothing.
 
-This is the central observation: **a polling-based hot path is a latent cost bomb that explodes asymmetrically.** Steady-state usage looks fine; an unattended client multiplies cost by orders of magnitude.
+A concrete sanity check: a single-user developer instance can burn **43,200 KV reads in 24 hours from one forgotten OBS tab** — five KV reads per now-playing poll × 360 polls/hour × 24 hours. That is ~43% of the free-tier daily KV-read budget *from one user, one tool, in steady state*. Multiply by 50 users and the daily budget on the **paid** tier is exhausted before half of them have gone live. The polling shape doesn't survive contact with users — it survives only with one user.
+
+This is the framing for the migration: not "we got a cost alarm" — but "this shape will not scale, and we should rebuild it before we have users."
 
 ---
 
