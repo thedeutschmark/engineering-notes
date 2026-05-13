@@ -127,19 +127,15 @@ This ended up mattering for user trust as much as for architecture. A product fe
 
 One of the ideas that became more important over time was what the product calls `Glass Box Transparency`.
 
-The short version is that I did not want the system making consequential changes in silence.
+Honest assessment: it is a minor feature dressed up as a major one. The optimizer surfaces a small inspector that shows what it changed, what it left alone, and which job-description term each rewrite was reaching for. About 20% of users actually open it. The other 80% trust the output, scan the score, and move on, which is the correct behavior for a product whose job is to save them time.
 
-The longer version is that there are really three different Glass Boxes in the app:
+The transparency panel is more useful to me than to the user. I look at it constantly while tuning the optimizer because it surfaces when the model is reaching for a phrase the user did not actually do. For a user, the value is more or less "I can audit if I want to," and most do not want to.
 
-- the persona layer
-- the optimizer and its multi-stage process
-- the inbound intelligence layer
+There are technically three Glass Boxes in the app, one in the persona layer, one in the optimizer, one in the inbound intelligence layer. Each is answering a slightly different trust question. The longer write-up lives in [Glass Box transparency](../glass-box-transparency/) for anyone curious.
 
-That distinction matters because each surface is answering a different trust question.
+It is a real principle. The optimizer should never be a black box that produces a score and a rewrite with no defensible reasoning. But it is a design choice I would defend more readily than a feature I would market. AI tooling has a habit of treating "look at the model's working" as a killer feature because the model finds its own working interesting. Humans find correct outputs interesting and find working interesting only when something is wrong. So the panel exists, it is wired to the same generation events the optimizer uses, and it is there for the user who wants it.
 
-I go into that in more detail in [Glass Box transparency](../glass-box-transparency/), but the basic point is simple: transparency should show the user enough of the basis for action that the system feels inspectable without dumping raw internals or pretending to reveal some magical private chain of thought.
-
-That ended up being especially important in the optimizer, where the system is moving through multiple stages of analysis, inference, generation, and review.
+What was actually load-bearing in the same design pass was the save gate inside the optimizer that holds artifacts back when the validator flags a fabricated claim. That one stops bad output from reaching the user at all, which is a feature whose value does not depend on the user opening a panel.
 
 ## The ATS visibility gap
 
@@ -192,6 +188,10 @@ The companion layer exists because tone affects whether the product feels steady
 So the persona is bounded. It can be direct. It can be sharp. It can respond differently by mode. But it is still there to support the rest of the system, not to become the system.
 
 That is why I think of it as a companion layer rather than as a chatbot feature.
+
+A lot of how this layer thinks and talks to the user came out of an earlier project I built called `forgetmenot`. That was a bot whose entire reason for existing was persistent memory across conversations, plus a steady, slightly opinionated way of recalling what it knew about a user without sounding either sycophantic or robotic. The technical and tonal lessons from that build carry directly into how the companion layer here remembers context, when it surfaces it, and how it stays in character without drifting into improvisation.
+
+The longer write-up of that work lives in [chat-bot-memory](../chat-bot-memory/). Most of what is useful in this companion layer is downstream of decisions I made there.
 
 ## Learning from outcomes
 
