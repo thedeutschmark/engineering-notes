@@ -66,6 +66,8 @@ chatters. alice keeps challenging the streamer to a 1v1. bob started a
 
 Each episode is written by a low-temperature summarization pass over a window of 25–100 events. The compaction loop reads unsummarized events since the last episode, builds a transcript, and asks the LLM for a short factual summary plus a rough topic label.
 
+Episodes are grouped by broadcast. When a stream ends, the bot writes a one-paragraph *recap* of the whole session and keeps it after the individual episodes age out — so a returning viewer gets "last time" continuity without the bot replaying every summary. At reply time the prompt labels **this stream** and **last stream** separately, so the model doesn't blur "now" into "the time before."
+
 ### Speaker metadata *(volatile)*
 
 One short line derived from the viewers table — mod, VIP, regular, or newer viewer — with a posture hint attached. Mods get deference, regulars get familiarity, newer viewers get curiosity instead of condescension.
@@ -169,6 +171,38 @@ The order is the discipline. Skipping to vector search because it sounds more ad
 
 ---
 
+## Inspiration: TurboQuant and the "compress, don't hoard" thesis
+
+A paper landed that is, on its face, about something this system deliberately does *not* do — and it ended up validating the design anyway.
+
+[Google Research's TurboQuant](https://arxiv.org/abs/2504.19874) is a vector quantization method: it squeezes high-dimensional float vectors down to roughly 2.5–3.5 bits per coordinate while preserving their geometry well enough that downstream tasks barely notice. The mechanism is three moves: randomly rotate the vector (which makes its coordinates near-independent and identically distributed), apply an optimal per-coordinate scalar quantizer, then — because that first pass is biased for inner products — add a single-bit correction on the residual using a *quantized Johnson–Lindenstrauss* (QJL) transform. It is data-oblivious: no training, no per-dataset calibration, quantize in microseconds. It compresses an LLM's KV cache by more than 4× with no measurable quality loss, and beats *trained* product quantization on nearest-neighbor recall with effectively zero indexing overhead.
+
+(Two popular write-ups described TurboQuant as "PolarQuant plus QJL." That's wrong, and worth correcting because it's easy to repeat: PolarQuant is a *different, earlier* method that TurboQuant benchmarks against and beats. The rotation → scalar → QJL pipeline above is the actual thing.)
+
+So why does a billion-vector compression paper matter to a bot whose entire retrieval candidate set is a few dozen rows? Three ways, in descending order of how soon they're worth acting on.
+
+**It validates the thesis.** The premise of this whole system is "find the smallest representation that still preserves what matters." TurboQuant is the same instinct taken to its information-theoretic limit — and it proves, formally (within a small constant of the Shannon bound), that you can discard most of the bits and keep almost all of the useful geometry. That is the academic version of "persist summaries, not transcripts." The paper is a long argument that compression isn't a compromise; it's the design.
+
+**It hands over one cheap, scale-appropriate trick.** The QJL stage, stripped down, is `sign(S · x)` — project a vector through a random matrix, keep only the sign of each result. That one-bit sketch has a useful property: the Hamming distance between two sketches is an *unbiased* estimate of the angle between the original vectors. Cheap to compute, cheap to store, no training.
+
+It points at the one place this system already compares small sets of facts: **duplicate detection.** Today, dedup is lexical — token-set overlap (Jaccard) plus substring matching, and it has an honest blind spot: "plays drums" and "is a drummer" score about 0.33 and slip past the threshold as two separate facts. The tempting move is to sketch each fact and compare by Hamming distance. *I prototyped exactly that — and it taught the real lesson the hard way.* Over a **bag-of-tokens** feature vector, a sign-projection sketch is mathematically close to Jaccard: it catches reordered or near-identical phrasings, but **not** zero-overlap synonyms. "plays drums" and "is a drummer" share no tokens, so their sketches are about as far apart as two unrelated facts — empirically ~20 bits, indistinguishable from noise at any safe threshold. The sketch only preserves the geometry of the vector you feed it, and a bag-of-tokens vector has no *semantic* geometry. So the catchment for true synonym dedup isn't a clever hash — it's an actual embedding, the very thing deferred below. I removed the prototype; dedup stays lexical until embeddings earn their place.
+
+**It de-risks the embeddings step we keep deferring.** The honest reason "embeddings, maybe" sits at the bottom of the roadmap isn't snobbery — it's that embeddings break the local-first promise. Float32 vectors plus an index are heavy to keep in a SQLite file on a streamer's machine, and most vector stores want a server. TurboQuant is exactly the result that dissolves that objection *if the day ever comes*: a few thousand notes stored as packed bit-blobs, scanned brute-force by Hamming distance — no codebook, no vector extension, no training step. The escape hatch is now documented. Embeddings still come last; but if they come, they can come without betraying the architecture.
+
+What I am explicitly **not** doing is building a quantizer now. At a few dozen rows a float comparison is already microseconds; quantization would save bytes that don't matter and latency that's invisible, while adding approximate-math code that has to stay correct in software a non-engineer installs and forgets. The KV-cache headline doesn't apply either — the reply model lives in the cloud, so the bot doesn't own a KV cache to compress. Importing the machinery would be the precise "skip to vector search because it sounds advanced" failure this note already warns against. The idea earns its place; the implementation does not, yet.
+
+### The deeper lesson: spend bits where the variance is
+
+The part of the paper that actually changed how I think about the budget is a detail buried in the KV-cache experiments. TurboQuant doesn't quantize every channel to the same width. It splits channels into "outliers" and the rest and spends *more* bits on the high-variance outlier channels — 32 channels at 3 bits, 96 at 2 bits, averaging to a nominal "2.5-bit" budget. Uniform allocation would be strictly worse for the same total cost. The principle: **representation budget is most valuable where the variance lives, and spending it uniformly wastes it.**
+
+This system had already started down that road — retrieval ranks notes by a `confidence × recency` blend, not pure recency, so the drop ladder that keeps the top-ranked few is already biased toward signal. The TurboQuant lesson pushed it further: stale-decay now scales with confidence too (a high-confidence note survives a longer window than a shaky one), so the *same* note isn't decayed on the *same* clock regardless of how trusted it is. That's the principle landing on the retention and decay axes.
+
+Where it's still only half-applied: **distinctiveness.** Confidence and recency say how *trusted* and how *fresh* a note is, but not how much unique signal it carries. A fact no other note sits near deserves more of the budget than one that half-overlaps three others — and that's the one signal the current ranking doesn't model (it's also, ironically, the thing a real embedding would finally make cheap to measure). The sharper rule, fully realized: **let signal — trust, freshness, *and* distinctiveness — drive what survives a trim and what resists decay**, not position alone.
+
+Concretely, this turns the vague "confidence-weighted selection" roadmap item into something measurable. Once evaluation is recording which note IDs the LLM actually saw for good replies versus bad ones (item 1), the number to watch is **survival-weighted retrieval quality**: of the notes that survived the budget for a *good* reply, how many were high-signal by these measures — and for a *bad* reply, did a high-signal note get trimmed in favor of a recent-but-noisy one? That ratio is the feedback loop that says whether non-uniform allocation is buying anything, *before* writing a line of ranking code. Measure first; it's the same discipline the rest of this system already runs on.
+
+---
+
 ## The LLM stays in the cloud
 
 Reply generation uses a hosted provider — Gemini or OpenAI — not a local model.
@@ -197,6 +231,8 @@ Extraction has a few specific guardrails:
 - Low-confidence candidates are dropped. The extractor returns a confidence score per note and anything under 0.4 is skipped.
 - Duplicate detection runs before insert. If an incoming fact is substantially similar to an existing note, the old note's `last_confirmed_at` is bumped and the new one is dropped — which turns "we keep hearing this" into a recency signal instead of a storage signal.
 - Conflicting facts supersede rather than overwrite. The old row is kept with `status = 'superseded'`, pointing at the row that replaced it, so history stays reconstructable.
+
+Provenance is surfaced *to the model*, not just stored. Each note carries a `source_kind` — did the subject say it themselves, did someone else say it about them, or did the bot infer it from behavior — and the prompt renders these as `[said]`, `[reported]`, and `[guess]` tags so the model can weight a first-hand claim above secondhand gossip above a hunch. The originating snippet stays in the database for review but is deliberately left out of the default prompt, so one stray quote can't overweight the bot's sense of a person.
 
 > Memory is easier to reason about when you can always answer the question "where did this come from?"
 
@@ -254,8 +290,9 @@ That is the right outcome for this class of tool.
 
 ## What I would change next
 
-- Land real evaluation on top of the row-ID trail already being recorded, so retrieval changes are measurable instead of aesthetic.
-- Add hygiene passes on the notes table — duplicate merging, stale decay, confidence-weighted ordering.
+- Land real evaluation on top of the row-ID trail already being recorded, so retrieval changes are measurable instead of aesthetic. The metric to chase is survival-weighted retrieval quality — did high-signal notes survive the budget for good replies, and get wrongly trimmed before bad ones?
+- Keep sharpening hygiene: duplicate merging and confidence-weighted ordering are in; confidence-scaled stale-decay landed. The open item is *semantic* dedup ("plays drums" / "is a drummer") — and the honest finding is that a token-feature sketch won't do it; that one waits for embeddings, with QJL as what makes embeddings cheap.
+- Add **distinctiveness** to the retrieval signal (trust and freshness already count; semantic isolation doesn't yet) and — the part that actually matters — *measure* whether the weighting helps via survival-weighted retrieval quality, before adding more ranking knobs.
 - Try LLM rerank on the candidate pool before reaching for embeddings.
 - Tune memory depth per channel or chat velocity — a dead chat should not get the same working set as a 400-messages-per-minute raid.
 
