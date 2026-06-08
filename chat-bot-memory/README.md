@@ -22,19 +22,21 @@ The real design question became: **what is the smallest amount of persistent sta
 
 ## The three-tier memory model
 
+![The three-tier memory model: events age out on a 24h TTL; episodes and semantic notes are kept](./assets/three-tier-memory.png)
+
 The system splits memory into tiers with different jobs and different lifetimes.
 
 - **Tier 1 — events** are the raw stream: chat messages and moderation signals as they happen. Pruned on a 24-hour TTL.
 - **Tier 2 — episodes** are short LLM-written summaries of chunks of stream activity. Written by a compaction loop that runs every few minutes.
 - **Tier 3 — semantic notes** are durable facts about specific viewers, the channel, and recurring bits. Written only from episode summaries, never directly from raw chat.
 
-Only the top two tiers are intended to live long. Raw events exist so a summary pass has material to work from, then they age out.
-
-That distinction is the whole design.
+Only the top two tiers are intended to live long. Raw events exist so a summary pass has material to work from, then they age out — and that split is the whole design.
 
 ---
 
 ## What a reply actually looks at
+
+![What a reply looks at: a stable, cacheable prefix above the line and a volatile, per-message tail below it](./assets/prompt-stack.png)
 
 When a message comes in, the bot builds a prompt from a small stable prefix and a small volatile tail. Here is what each piece contains.
 
@@ -52,7 +54,7 @@ A handful of durable facts scoped to the channel:
 • movie night Discord is still TBD
 ```
 
-These are semantic notes with `scope = 'channel'`, pulled most-recently-confirmed first.
+These are semantic notes with `scope = 'channel'`, ranked by confidence and recency.
 
 ### Recent episodes *(stable-ish)*
 
@@ -81,7 +83,7 @@ LORE (alice):
 • knows a lot about audio gear
 ```
 
-These are semantic notes with `scope = 'viewer'` and `subject_id` matching the speaker's login. Top ten by last-confirmed timestamp.
+These are semantic notes with `scope = 'viewer'` and `subject_id` matching the speaker's login. Top ten, ranked by confidence and recency.
 
 ### The speaker's own recent messages *(volatile)*
 
@@ -123,6 +125,8 @@ The rule that falls out: **if something changes every message, it cannot live in
 
 ## The token budget
 
+![The drop ladder: when the prompt is over budget, sections shed in priority order, with a floor that is never dropped](./assets/drop-ladder.png)
+
 Every reply has a fixed input budget. The assembler estimates the prompt size and, if it is over budget, drops sections in priority order:
 
 1. episodes first
@@ -139,18 +143,19 @@ This is one of the places where the three-tier model earns its keep. Raw chat is
 
 ---
 
-## Retrieval is recency-only SQL, on purpose
+## Retrieval is a SQL sort, not a search
 
-There are no embeddings here. No vector store. No semantic search layer. Retrieval is literal:
+There are no embeddings here. No vector store. No semantic search layer. Retrieval is a single `ORDER BY` — a cheap confidence-weighted recency sort:
 
-```
-SELECT fact FROM semantic_notes
+```sql
+SELECT id, fact, source_kind FROM semantic_notes
 WHERE scope = 'viewer' AND subject_id = ? AND status = 'active'
-ORDER BY last_confirmed_at DESC
+ORDER BY confidence * (1.0 / (1 + age_days / 7)) DESC,
+         last_confirmed_at DESC
 LIMIT 10
 ```
 
-That is the whole retrieval system.
+That's the whole retrieval system — a note's score is its confidence, decayed gently by age, with recency as the tiebreaker.
 
 This was not a rush job that will get replaced with embeddings next sprint. It is the shape the problem actually has.
 
@@ -158,28 +163,30 @@ The candidate set per call is small. When someone types, the relevant semantic n
 
 > The runtime context budget tells the story. It fits comfortably in a single prompt. There is no retrieval problem to solve because the relevant memory is small enough to include directly.
 
-The honest ranking of what to improve first runs in this order:
+I almost reached for a vector store anyway, because it felt more legitimate. Then I counted the rows. I would have been bolting a search engine onto the job of ordering five things.
 
-1. **Evaluation.** Before making retrieval smarter, make it measurable. What did the LLM actually see when it produced a good reply versus a bad one? The prompt assembler already records the row IDs of every note that survived budget trim into `token_usage_json`, so retrieval quality can be scored against outcomes retroactively.
-2. **Hygiene and confidence-weighted selection.** Prune duplicate notes, decay stale ones, and let the `confidence` column affect ordering. Cheap, deterministic, high-impact.
+The honest ranking of what to improve next:
+
+1. **Evaluation.** Before making retrieval smarter, make it measurable. What did the LLM actually see when it produced a good reply versus a bad one? The prompt assembler already records the row IDs of every note that survived budget trim into `token_usage_json`, so retrieval quality can be scored against outcomes retroactively. That trail is sitting there unused.
+2. **More hygiene.** Confidence-weighted ordering and duplicate-merge-on-write already landed. Still open: decaying stale notes out of the active set, and auto-detecting *conflicts* at write time — the supersede path exists, but today it is manual.
 3. **LLM rerank of the candidate pool.** Before reaching for embeddings, try letting the model itself pick the most relevant notes out of a slightly larger pool. Often good enough at this scale.
 4. **Embeddings, maybe.** Only once the above have been tried and found wanting.
 
-The order is the discipline. Skipping to vector search because it sounds more advanced is a common failure mode in this class of system.
+Keeping that order is the discipline; skipping straight to vector search because it sounds more advanced is the easy mistake here.
 
 ---
 
 ## The LLM stays in the cloud
 
-Reply generation uses a hosted provider — Gemini or OpenAI — not a local model.
+Reply generation uses a hosted provider — currently Gemini — not a local model.
 
 This is the opposite of the memory choice, and it is deliberate.
 
 Streaming already contends for GPU on the streamer's machine. OBS, the game, capture encoding, and sometimes a 3D overlay are all already fighting for VRAM. Asking the same machine to also host a chat-reply model in the hot path would make the streaming experience worse for no gain in quality.
 
-The cloud provider is good at generating text. The local machine is good at owning the data. The split matches the actual constraints.
+The cloud provider is good at generating text; the local machine is good at owning the data. The split just follows the constraints.
 
-A `llmBaseUrl` override exists so a user with a dedicated inference box can point the bot at a self-hosted endpoint, but that is an opt-in case. The default assumption is that the streamer has one computer and it is busy streaming.
+The architecture leaves a clean seam for this: a user with a dedicated inference box could point the bot at a self-hosted endpoint. But that is a future opt-in, not something the current build ships. The default assumption is that the streamer has one computer and it is busy streaming.
 
 ---
 
@@ -196,7 +203,7 @@ Extraction has a few specific guardrails:
 - Notes are written only from episode summaries, never directly from messages. Every note has an episode ID as its supporting evidence, so the source is always recoverable.
 - Low-confidence candidates are dropped. The extractor returns a confidence score per note and anything under 0.4 is skipped.
 - Duplicate detection runs before insert. If an incoming fact is substantially similar to an existing note, the old note's `last_confirmed_at` is bumped and the new one is dropped — which turns "we keep hearing this" into a recency signal instead of a storage signal.
-- Conflicting facts supersede rather than overwrite. The old row is kept with `status = 'superseded'`, pointing at the row that replaced it, so history stays reconstructable.
+- Conflicting facts are designed to supersede, not overwrite. The schema keeps the old row with `status = 'superseded'`, pointing at the row that replaced it, so history stays reconstructable. Auto-detecting conflicts at write time is still on the list — today that path is manual.
 
 > Memory is easier to reason about when you can always answer the question "where did this come from?"
 
@@ -234,13 +241,13 @@ The design works because it is opinionated, which means the tradeoffs are clear.
 
 **Old detail decays.** Compressed memory means some older specifics eventually fall out. That is acceptable. The goal is continuity, not forensic reconstruction.
 
-**Retrieval is coarse.** Recency-only SQL is blunt. There will be cases where a genuinely relevant older note does not surface because something newer pushed it past the limit. The measurement and rerank steps in the roadmap exist to sharpen that without overbuilding.
+**Retrieval is coarse.** A confidence-weighted recency sort is still blunt. There will be cases where a genuinely relevant older note does not surface because something newer pushed it past the limit. The measurement and rerank steps in the roadmap exist to sharpen that without overbuilding.
 
 **Live context stays shallow.** The rolling chat buffer is intentionally small. That keeps reply cost under control, but it also means the bot only has a narrow window into the current conversation.
 
 **Local-first has a setup cost.** The streamer has to run a small background process on the machine that streams. In exchange, their chat data stays on a disk they own.
 
-Those are all tradeoffs I would still make again.
+I'd make all of these tradeoffs again.
 
 ---
 
@@ -250,12 +257,12 @@ The reason I like this design is that it solves the actual problem without becom
 
 The bot remembers enough to feel consistent. Persistent state stays compact. Raw chat is not retained as canonical history. Retrieval is honest about its complexity. The LLM is in the cloud where it belongs; the data is on the streamer's machine where it belongs.
 
-That is the right outcome for this class of tool.
+For a tool one person runs on their own machine, that is the outcome I wanted.
 
 ## What I would change next
 
 - Land real evaluation on top of the row-ID trail already being recorded, so retrieval changes are measurable instead of aesthetic.
-- Add hygiene passes on the notes table — duplicate merging, stale decay, confidence-weighted ordering.
+- Finish the hygiene passes on the notes table — stale decay and auto-superseding conflicts at write time (confidence-weighted ordering and duplicate merging already landed).
 - Try LLM rerank on the candidate pool before reaching for embeddings.
 - Tune memory depth per channel or chat velocity — a dead chat should not get the same working set as a 400-messages-per-minute raid.
 
@@ -263,4 +270,4 @@ I would keep the same basic architecture, though. The main ideas are still corre
 
 ## Running it
 
-This is part of [ForgetMeNot](https://github.com/thedeutschmark/forgetmenot). Configuration lives in the toolkit at [toolkit.deutschmark.online](https://toolkit.deutschmark.online); the auth surface is [auth.deutschmark.online](https://auth.deutschmark.online).
+This is part of [ForgetMeNot](https://github.com/thedevmark/forgetmenot). Configuration lives in the toolset at [toolset.deutschmark.online](https://toolset.deutschmark.online); the auth surface is [auth.deutschmark.online](https://auth.deutschmark.online).
