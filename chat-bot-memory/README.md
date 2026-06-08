@@ -30,9 +30,7 @@ The system splits memory into tiers with different jobs and different lifetimes.
 - **Tier 2 — episodes** are short LLM-written summaries of chunks of stream activity. Written by a compaction loop that runs every few minutes.
 - **Tier 3 — semantic notes** are durable facts about specific viewers, the channel, and recurring bits. Written only from episode summaries, never directly from raw chat.
 
-Only the top two tiers are intended to live long. Raw events exist so a summary pass has material to work from, then they age out.
-
-That distinction is the whole design.
+Only the top two tiers are intended to live long. Raw events exist so a summary pass has material to work from, then they age out — and that split is the whole design.
 
 ---
 
@@ -157,7 +155,7 @@ ORDER BY confidence * (1.0 / (1 + age_days / 7)) DESC,
 LIMIT 10
 ```
 
-That is the whole retrieval system. A note's score is its confidence, decayed gently by age, with recency as the tiebreaker.
+That's the whole retrieval system — a note's score is its confidence, decayed gently by age, with recency as the tiebreaker.
 
 This was not a rush job that will get replaced with embeddings next sprint. It is the shape the problem actually has.
 
@@ -174,7 +172,7 @@ The honest ranking of what to improve next:
 3. **LLM rerank of the candidate pool.** Before reaching for embeddings, try letting the model itself pick the most relevant notes out of a slightly larger pool. Often good enough at this scale.
 4. **Embeddings, maybe.** Only once the above have been tried and found wanting.
 
-The order is the discipline. Skipping to vector search because it sounds more advanced is the easy mistake to make here.
+Keeping that order is the discipline; skipping straight to vector search because it sounds more advanced is the easy mistake here.
 
 ---
 
@@ -186,7 +184,7 @@ This is the opposite of the memory choice, and it is deliberate.
 
 Streaming already contends for GPU on the streamer's machine. OBS, the game, capture encoding, and sometimes a 3D overlay are all already fighting for VRAM. Asking the same machine to also host a chat-reply model in the hot path would make the streaming experience worse for no gain in quality.
 
-The cloud provider is good at generating text. The local machine is good at owning the data. The split matches the actual constraints.
+The cloud provider is good at generating text; the local machine is good at owning the data. The split just follows the constraints.
 
 The architecture leaves a clean seam for this: a user with a dedicated inference box could point the bot at a self-hosted endpoint. But that is a future opt-in, not something the current build ships. The default assumption is that the streamer has one computer and it is busy streaming.
 
@@ -249,7 +247,7 @@ The design works because it is opinionated, which means the tradeoffs are clear.
 
 **Local-first has a setup cost.** The streamer has to run a small background process on the machine that streams. In exchange, their chat data stays on a disk they own.
 
-Those are all tradeoffs I would still make again.
+I'd make all of these tradeoffs again.
 
 ---
 
