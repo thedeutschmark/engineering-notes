@@ -6,7 +6,7 @@ I wanted something stricter than that.
 
 The score needed to be explainable. The rewriting needed to stay inside the truth. The system needed to account for ghosting, weak listings, recruiter latency, and the fact that most users are navigating a high-friction process rather than a neat funnel.
 
-That became P.A.T.H.O.S., short for Personal Automated Tracking & Hiring Optimization System.
+That became P.A.T.H.O.S., short for Personalized Application Tracking & Hiring Optimization System.
 
 ## The problem I was trying to solve
 
